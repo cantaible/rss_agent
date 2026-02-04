@@ -265,13 +265,20 @@ from langgraph.graph import StateGraph, END
 # 1. 拿出一张空白地图
 workflow = StateGraph(AgentState)
 
+# Chat Node: 使用 LLM 进行自然对话
+def chat_node(state):
+    """聊天模式节点 - 调用 LLM 进行多轮对话"""
+    # state["messages"] 已包含历史上下文（由 run_agent 的滑动窗口提供）
+    response = llm_fast.invoke(state["messages"])
+    return {"messages": [response]}
+
 # 2. 在地图上画站点 (Nodes)
 workflow.add_node("router", router_node)
 workflow.add_node("saver", saver_node)
 workflow.add_node("fetcher", fetcher_node)
 workflow.add_node("writer", writer_node)
 workflow.add_node("detail", detail_node) # 新增 Detail 节点
-workflow.add_node("chat", lambda x: {"messages": [AIMessage(content="我是聊天模式(暂未接入LLM)")]})
+workflow.add_node("chat", chat_node)
 
 # 3. 设置起点
 workflow.set_entry_point("router")

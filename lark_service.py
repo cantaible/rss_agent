@@ -13,13 +13,27 @@ app = FastAPI()
 
 def run_agent(user_id, text, message_id=None):
     """运行 LangGraph Agent"""
+    config = {"configurable": {"thread_id": user_id}}
+    
+    # 获取历史消息（用于聊天模式的上下文记忆）
+    try:
+        previous_state = graph.get_state(config)
+        history = previous_state.values.get("messages", []) if previous_state and previous_state.values else []
+    except Exception:
+        history = []
+    
+    # 滑动窗口：只保留最近10条消息（约5轮对话），避免超 Token 限额
+    recent_history = history[-10:] if len(history) > 10 else history
+    
+    # 拼接历史 + 新消息
     inputs = {
-        "messages": [HumanMessage(content=text)], 
+        "messages": recent_history + [HumanMessage(content=text)], 
         "user_id": user_id,
         "message_id": message_id
     }
+    
     # 传入 thread_id 以启用 state 持久化（每个用户独立存储）
-    res = graph.invoke(inputs, config={"configurable": {"thread_id": user_id}})
+    res = graph.invoke(inputs, config=config)
     return res["messages"][-1].content
 
 # 定义一个 GET 接口，访问根路径 "/" 时触发
