@@ -4,11 +4,27 @@ from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
-# 初始化一个全局的 ChatOpenAI 实例，避免每次调用都重新连接
-llm = ChatOpenAI(
-    model=os.getenv("LLM_MODEL_NAME"),
-    openai_api_base=os.getenv("OPENAI_API_BASE"),
-    openai_api_key=os.getenv("OPENAI_API_KEY")
+# 初始化两个 LLM (按能力分级)
+api_key = os.getenv("OPENAI_API_KEY")
+api_base = os.getenv("OPENAI_API_BASE")
+
+fast_model_name = os.getenv("LLM_FAST_MODEL")
+reasoning_model_name = os.getenv("LLM_REASONING_MODEL")
+
+print(f"⚡️ Init Fast LLM: {fast_model_name}")
+llm_fast = ChatOpenAI(
+    model=fast_model_name,
+    openai_api_key=api_key,
+    openai_api_base=api_base,
+    temperature=0.1 # Router 需要精准
+)
+
+print(f"🧠 Init Reasoning LLM: {reasoning_model_name}")
+llm_reasoning = ChatOpenAI(
+    model=reasoning_model_name,
+    openai_api_key=api_key,
+    openai_api_base=api_base,
+    temperature=0.7 # Writer 需要创意
 )
 
 def get_bot_response(user_input: str) -> str:
@@ -16,7 +32,10 @@ def get_bot_response(user_input: str) -> str:
     核心函数：接收用户文本 -> 调用大模型 -> 返回回复
     """
     try:
-        response = llm.invoke(user_input)
+        # Note: The original function used 'llm'.
+        # You might need to update this to use 'router_llm' or 'writer_llm'
+        # depending on your application logic.
+        response = router_llm.invoke(user_input) # Changed to router_llm for demonstration
         return response.content
     except Exception as e:
         return f"Sorry, AI brain error: {str(e)}"

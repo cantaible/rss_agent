@@ -1,101 +1,31 @@
-# FastAPI 是 web 框架，负责定义有什么接口 (URL)
+# FastAPI 是 web 框架
 from fastapi import FastAPI
-# Uvicorn 是服务器引擎，负责把代码跑起来
 import uvicorn
-import lark_oapi as lark
-import os
-from dotenv import load_dotenv
+import json
+from fastapi import BackgroundTasks, Request
 
-# 加载环境变量
-load_dotenv()
-
-app_id = os.getenv("LARK_APP_ID")
-app_secret = os.getenv("LARK_APP_SECRET")
-print(f"DEBUG: AppID={app_id}, Secret={'*' * len(app_secret) if app_secret else 'None'}")
-
-# 初始化飞书客户端
-lark_client = lark.Client.builder() \
-    .app_id(app_id.strip()) \
-    .app_secret(app_secret.strip()) \
-    .log_level(lark.LogLevel.DEBUG) \
-    .build()
-
-
+from agent_graph import graph
+from langchain_core.messages import HumanMessage
+from messaging import reply_message
 
 # 创建一个 App 实例
 app = FastAPI()
 
-import json
-from agent_graph import graph
-from langchain_core.messages import HumanMessage
-
-def run_agent(user_id, text):
+def run_agent(user_id, text, message_id=None):
     """运行 LangGraph Agent"""
-    inputs = {"messages": [HumanMessage(content=text)], "user_id": user_id}
-    res = graph.invoke(inputs)
+    inputs = {
+        "messages": [HumanMessage(content=text)], 
+        "user_id": user_id,
+        "message_id": message_id
+    }
+    # 传入 thread_id 以启用 state 持久化（每个用户独立存储）
+    res = graph.invoke(inputs, config={"configurable": {"thread_id": user_id}})
     return res["messages"][-1].content
 
-
-import requests
-
-def get_tenant_access_token():
-    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    headers = {"Content-Type": "application/json; charset=utf-8"}
-    data = {
-        "app_id": app_id.strip(),
-        "app_secret": app_secret.strip()
-    }
-    resp = requests.post(url, headers=headers, json=data)
-    if resp.status_code == 200:
-        return resp.json().get("tenant_access_token")
-    else:
-        print(f"❌ Failed to get token: {resp.text}")
-        return None
-
-def reply_message(message_id, content):
-    """
-    调用飞书 API 回复用户 (Raw HTTP)
-    """
-    try:
-        token = get_tenant_access_token()
-        if not token:
-            print("❌ Cannot send message without token")
-            return
-            
-        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8"
-        }
-        payload = {
-            "content": json.dumps({"text": content}),
-            "msg_type": "text"
-        }
-        
-        resp = requests.post(url, headers=headers, json=payload)
-        
-        if resp.status_code != 200:
-            print(f"❌ Lark API Error: {resp.text}")
-        else:
-            # 飞书 API 即使 200 也可能在 body 里报错
-            res_json = resp.json()
-            if res_json.get("code") != 0:
-                print(f"❌ Lark Logic Error: {res_json}")
-            else:
-                print(f"✅ Reply Sent: {content[:20]}...")
-            
-    except Exception as e:
-        print(f"❌ Exception in reply_message: {str(e)}")
-
-
-
 # 定义一个 GET 接口，访问根路径 "/" 时触发
-# 比如你在浏览器访问 http://localhost:8000/ 就会看到这里的返回值
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "Bot is running! (机器人正在运行)"}
-
-from fastapi import BackgroundTasks, Request
 
 # 异步后台任务：AI 思考并回复
 def process_lark_message(event_data):
@@ -106,10 +36,12 @@ def process_lark_message(event_data):
     # 提取发送者 ID
     sender_id = event_data["sender"]["sender_id"]["open_id"]
     
-    # AI 思考 (传入 ID)
-    ai_reply = run_agent(sender_id, user_text)
+    # AI 思考 (传入 ID 和 Message ID)
+    ai_reply = run_agent(sender_id, user_text, message_id)
+    
     # 回复
     reply_message(message_id, ai_reply)
+
 
 
 @app.post("/api/lark/event")
@@ -117,16 +49,61 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
     # 解析原始 JSON
     body = await request.json()
     
+    # 🔍 调试日志：打印所有收到的请求
+    print(f"\n{'='*60}")
+    print(f"📨 [DEBUG] Received request")
+    print(f"Request type: {body.get('type')}")
+    print(f"Event type: {body.get('header', {}).get('event_type')}")
+    print(f"Full body keys: {list(body.keys())}")
+    print(f"{'='*60}\n")
+    
     # 1. 握手验证
     if body.get("type") == "url_verification":
+        print("✅ [Verification] Responding to URL verification")
         return {"challenge": body.get("challenge")}
         
     # 2. 处理用户消息 (Event v2 格式)
     if body.get("header", {}).get("event_type") == "im.message.receive_v1":
+        print("📧 [Message] Processing user message")
         # 放入后台运行，不阻塞 HTTP 返回
         background_tasks.add_task(process_lark_message, body["event"])
+        
+    # 3. 处理卡片交互 (Card Action)
+    # 当用户点击卡片按钮时触发
+    elif body.get("header", {}).get("event_type") == "card.action.trigger":
+        # 从 event 对象中获取数据
+        event_data = body.get("event", {})
+        action_value = event_data.get("action", {}).get("value", {})
+        command = action_value.get("command")
+        target = action_value.get("target")
+        
+        # 构造模拟的文本指令，例如 "展开：硬件与算力"
+        if command == "expand" and target:
+            simulated_text = f"展开：{target}"
+            print(f"🃏 [Card Action] Received: {simulated_text}")
+            
+            # 获取用户和消息上下文信息
+            sender_id = event_data.get("operator", {}).get("open_id")
+            card_msg_id = event_data.get("context", {}).get("open_message_id")
+            
+            # 后台处理（不返回 Toast，避免3秒超时限制）
+            background_tasks.add_task(handle_card_action_async, sender_id, simulated_text, card_msg_id, target)
+            
+            # 返回成功响应，不显示 Toast
+            return {"code": 0}
     
     return {"code": 0}
+
+async def handle_card_action_async(user_id, text, message_id, target):
+    """处理卡片点击后的异步逻辑"""
+    print(f"🃏 [Async] Running agent for card action: {text}")
+    
+    # 立即发送"正在处理"消息，让用户知道系统已响应
+    reply_message(message_id, f"⏳ 正在为您展开 **{target}** 的详细内容，请稍候...")
+    
+    # 后台慢慢处理（无3秒限制）
+    ai_reply = run_agent(user_id, text, message_id)
+    reply_message(message_id, ai_reply)
 
 if __name__ == "__main__":
     # 启动服务器：
