@@ -19,6 +19,18 @@ def init_db():
         )
     ''')
     
+    # 缓存新闻内容的表（每天每个类别生成一次）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_news_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            content TEXT NOT NULL,
+            generated_at TIMESTAMP,
+            date TEXT NOT NULL,
+            UNIQUE(category, date)
+        )
+    ''')
+    
     conn.commit()
     conn.close()
     print("✅ Database initialized.")
@@ -44,6 +56,26 @@ def get_preference(user_id: str):
     cursor = conn.cursor()
     cursor.execute('SELECT category FROM user_preferences WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def save_cached_news(category, content, date_str):
+    """保存新闻缓存"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('''
+        INSERT OR REPLACE INTO daily_news_cache (category, content, generated_at, date)
+        VALUES (?, ?, ?, ?)
+    ''', (category, content, datetime.now(), date_str))
+    conn.commit()
+    conn.close()
+
+def get_cached_news(category, date_str):
+    """读取新闻缓存"""
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute(
+        'SELECT content FROM daily_news_cache WHERE category = ? AND date = ?',
+        (category, date_str)
+    ).fetchone()
     conn.close()
     return row[0] if row else None
 

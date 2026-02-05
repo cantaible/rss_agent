@@ -75,3 +75,40 @@ def reply_message(message_id, content):
             
     except Exception as e:
         print(f"❌ Exception in reply_message: {str(e)}")
+
+def send_message(receive_id, content):
+    """主动发送消息 (用于定时推送)"""
+    try:
+        token = get_tenant_access_token()
+        if not token: return
+        
+        url = "https://open.feishu.cn/open-apis/im/v1/messages"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        
+        params = {"receive_id_type": "open_id"}
+        
+        # 智能检测卡片
+        msg_type = "text"
+        final_content = content
+        if content.strip().startswith("{") and '"header"' in content:
+            msg_type = "interactive"
+        else:
+            final_content = json.dumps({"text": content})
+
+        payload = {
+            "receive_id": receive_id,
+            "content": final_content,
+            "msg_type": msg_type
+        }
+        
+        resp = requests.post(url, headers=headers, params=params, json=payload)
+        if resp.status_code != 200 or resp.json().get("code") != 0:
+            print(f"❌ Push Failed: {resp.text}")
+        else:
+            print(f"📤 Pushed to {receive_id}: {msg_type}")
+            
+    except Exception as e:
+        print(f"❌ Exception in send_message: {str(e)}")

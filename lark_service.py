@@ -7,6 +7,62 @@ from fastapi import BackgroundTasks, Request
 from agent_graph import graph
 from langchain_core.messages import HumanMessage
 from messaging import reply_message
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import date
+from database import save_cached_news, get_cached_news, DB_FILE, upsert_preference
+import sqlite3
+import asyncio
+
+# 初始化调度器
+scheduler = BackgroundScheduler()
+
+def pre_generate_daily_news():
+    """每天9点：预生成4个类别的早报"""
+    categories = ["AI", "GAMES", "MUSIC", "SHORT_DRAMA"]
+    today = date.today().isoformat()
+    print(f"🕘 [Schedule] Starting pre-generation for {today}...")
+    
+    for category in categories:
+        # 1. 关键修复：先在数据库里注册这个“系统用户”，确保 Fetcher 能查到偏好
+        sys_user_id = f"sys_gen_{category}"
+        upsert_preference(sys_user_id, category)
+        
+        # 2. 生成新闻
+        # 意图设为 read，Fetcher 会去读上面存的 sys_user_id 的偏好
+        print(f"📰 Generating {category}...")
+        briefing = run_agent(sys_user_id, f"看关于{category}的新闻")
+        
+        save_cached_news(category, briefing, today)
+        
+    print("✅ [Schedule] Pre-generation complete.")
+
+async def daily_push_task():
+    """每天10点：推送新闻"""
+    today = date.today().isoformat()
+    # 1. 获取所有用户偏好
+    conn = sqlite3.connect(DB_FILE)
+    users = conn.execute("SELECT user_id, category FROM user_preferences").fetchall()
+    conn.close()
+    
+    from messaging import send_message
+    
+    # 2. 按用户推送
+    for user_id, category in users:
+        # 读取缓存
+        cached_content = get_cached_news(category, today)
+        if cached_content:
+            print(f"📤 Pushing {category} to {user_id}")
+            # 注意：send_message 是同步的requests调用，这里简单起见直接调用
+            # 生产环境建议用 asyncio.to_thread 或 celary
+            send_message(user_id, cached_content)
+        else:
+            print(f"⚠️ No cache for {category}, skipping {user_id}")
+
+scheduler.add_job(pre_generate_daily_news, 'cron', hour=9, minute=0)
+scheduler.add_job(daily_push_task, 'cron', hour=10, minute=0)
+scheduler.start()
 
 # 创建一个 App 实例
 app = FastAPI()

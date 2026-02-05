@@ -57,9 +57,9 @@ python lark_service.py
 ### 4. 配置内网穿透
 
 ```bash
-cpolar http 36000
+cpolar http 8000
 # 或使用 ngrok
-ngrok http 36000
+ngrok http 8000
 ```
 
 将获得的 HTTPS 地址配置到飞书开放平台的事件订阅中。
@@ -89,3 +89,43 @@ MIT
 ## 🙏 致谢
 
 感谢 LangGraph 和飞书开放平台提供的强大能力。
+
+## 🛠️ 常见问题 (FAQ)
+
+### 🔌 cpolar 挂了怎么办？
+
+如果内网穿透服务中断或过期，请按以下步骤重启：
+
+1. **重启 cpolar**：
+   在终端运行命令（确保端口与服务一致，默认 8000）：
+   ```bash
+   cpolar http 8000
+   ```
+2. **获取新地址**：
+   复制终端输出的 HTTPS 地址，例如 `https://1a2b3c4d.r8.cpolar.cn`。
+
+3. **更新飞书配置**：
+   - 登录 [飞书开放平台](https://open.feishu.cn/)。
+   - 进入你的应用 -> **事件订阅**。
+   - 将 **请求地址 URL** 修改为新的地址（注意保留路径 `/`）。
+   - 点击 **保存**，飞书会发送 Challenge 验证，服务必须处于运行状态才能通过。
+
+### 🔒 如何固定 cpolar 域名（避免每次重启变动）？
+
+如果你希望拥有一个固定的域名（例如 `my-bot.cpolar.cn`），需要使用 cpolar 的**保留二级子域名**功能：
+
+1. **保留域名**：
+   - 登录 [cpolar 官网后台](https://dashboard.cpolar.com/reserved)。
+   - 找到 **保留** -> **保留二级子域名**。
+   - 选择地区（如 `China VIP` 或 `United States`）。
+   - 输入你想要的名称（例如 `rss-agent`），点击保留。
+
+2. **使用固定域名启动**：
+   在终端运行（替换 `<你的子域名>` 为你刚才保留的名称）：
+   ```bash
+   cpolar http -subdomain=<你的子域名> 8000
+   ```
+   例如：`cpolar http -subdomain=rss-agent 8000`
+
+3. **更新配置文件**：
+   如果这是一个长期使用的域名，建议更新飞书后台的事件订阅 URL，就不用每次都改了。
