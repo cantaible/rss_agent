@@ -179,7 +179,7 @@ MIT
 
    ```bash
    # 方式一：使用 git clone
-   git clone <你的仓库地址>
+   git clone https://github.com/cantaible/rss_agent.git
    cd rss_agent
    
    # 方式二：使用 scp 上传
@@ -207,11 +207,24 @@ MIT
    docker-compose logs -f
    ```
 
-5. **启动 cpolar**
+5. **安装 cpolar**
+
+   ```bash
+   # 一键安装
+   curl -L https://www.cpolar.com/static/downloads/install-release-cpolar.sh | sudo bash
+   
+   # 验证安装
+   cpolar version
+   
+   # 配置 authtoken（从 https://dashboard.cpolar.com/get-started 获取）
+   cpolar authtoken 你的token
+   ```
+
+6. **启动 cpolar**
 
    ```bash
    # 后台运行
-   nohup cpolar http 36000 -subdomain=ttrssbot -authtoken=你的token > cpolar.log 2>&1 &
+   nohup cpolar http 36000 -subdomain=ttrssbot > cpolar.log 2>&1 &
    
    # 查看 cpolar 日志
    tail -f cpolar.log
@@ -219,7 +232,7 @@ MIT
 
    获取 authtoken：访问 [cpolar 官网](https://dashboard.cpolar.com/get-started) 注册并复制 token
 
-6. **配置飞书事件订阅**
+7. **配置飞书事件订阅**
 
    - 访问飞书开放平台，进入你的应用
    - 在 **事件订阅** 中填入：`https://ttrssbot.cpolar.top/api/lark/event`
