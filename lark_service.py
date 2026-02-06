@@ -9,15 +9,15 @@ from agent_graph import graph
 from langchain_core.messages import HumanMessage
 from messaging import reply_message
 from apscheduler.schedulers.background import BackgroundScheduler
-
-from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import date
 from database import save_cached_news, get_cached_news, DB_FILE, upsert_preference, init_db
 import sqlite3
 import asyncio
+from pytz import timezone
 
-# 初始化调度器
-scheduler = BackgroundScheduler()
+# 初始化调度器（使用北京时区）
+beijing_tz = timezone('Asia/Shanghai')
+scheduler = BackgroundScheduler(timezone=beijing_tz)
 
 # def pre_generate_daily_news():
 #     """(已弃用) 每天9点：预生成4个类别的早报"""
@@ -90,28 +90,30 @@ def push_delivery_task():
 print("📦 Initializing database...")
 init_db()
 
-# 使用 FastAPI 推荐的 lifespan 方式替代已废弃的 on_event
+# 启动调度器（在模块加载时立即执行）
+print("⏰ Starting Scheduler...")
+from datetime import datetime, timedelta
+
+# 1. 厨师任务：北京时间 8:00 - 22:00，每2小时做一次饭
+scheduler.add_job(generate_news_task, 'cron', hour='8-22/2', minute=0, timezone=beijing_tz)
+
+# 2. 也是厨师任务：刚开业（启动服务）时先做一顿
+# 关键：这里 force=False，如果数据库里已经有菜了，就不重做了 (避免热重载时疯狂生成)
+scheduler.add_job(generate_news_task, 'date', run_date=datetime.now(beijing_tz) + timedelta(seconds=5), kwargs={"force": False})
+
+# 3. 外卖员任务：北京时间每天 10:10 准时送餐
+scheduler.add_job(push_delivery_task, 'cron', hour=10, minute=10, timezone=beijing_tz)
+
+scheduler.start()
+print(f"✅ Scheduler started with timezone: {beijing_tz}")
+
+# 使用 FastAPI 推荐的 lifespan 方式（用于优雅关闭）
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    print("⏰ Starting Scheduler...")
-    
-    # 1. 厨师任务：8:00 - 22:00，每2小时做一次饭
-    scheduler.add_job(generate_news_task, 'cron', hour='8-22/2', minute=0)
-    
-    # 2. 也是厨师任务：刚开业（启动服务）时先做一顿
-    # 关键：这里 force=False，如果数据库里已经有菜了，就不重做了 (避免热重载时疯狂生成)
-    from datetime import datetime, timedelta
-    scheduler.add_job(generate_news_task, 'date', run_date=datetime.now() + timedelta(seconds=5), kwargs={"force": False})
-    
-    # 3. 外卖员任务：每天 10:10 准时送餐
-    scheduler.add_job(push_delivery_task, 'cron', hour=17, minute=46)
-    
-    scheduler.start()
-    
     yield
     
-    # Shutdown (如果需要清理资源)
+    # Shutdown (优雅关闭调度器)
     print("🛑 Shutting down scheduler...")
     scheduler.shutdown()
 
