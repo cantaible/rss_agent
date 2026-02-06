@@ -44,21 +44,24 @@ def reply_message(message_id, content):
         
         try:
             # 简单的启发式检查：如果是 JSON 且包含 header/elements，就认为是卡片
-            if content.strip().startswith("{") and '"header"' in content and '"elements"' in content:
+            if isinstance(content, str) and content.strip().startswith("{") and '"header"' in content:
                 msg_type = "interactive"
-                # 卡片不需要再包一层 {"text": ...}，直接就是 JSON body
-                # 但飞书 API 要求 content 字段本身必须是 stringified json
                 final_content = content
             else:
                 # 普通文本需要包一层
-                final_content = json.dumps({"text": content})
-        except:
-            final_content = json.dumps({"text": content})
+                # 确保 content 是字符串
+                text_content = str(content) if content is not None else ""
+                final_content = json.dumps({"text": text_content}, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠️ JSON Check Error: {e}")
+            final_content = json.dumps({"text": str(content)}, ensure_ascii=False)
 
         payload = {
             "content": final_content,
             "msg_type": msg_type
         }
+        
+        print(f"📤 Sending Reply: type={msg_type}, content_len={len(final_content)}")
         
         resp = requests.post(url, headers=headers, json=payload)
         

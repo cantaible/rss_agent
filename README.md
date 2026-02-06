@@ -64,6 +64,26 @@ ngrok http 8000
 
 将获得的 HTTPS 地址配置到飞书开放平台的事件订阅中。
 
+### 5. 长期运行 (防休眠+后台)
+
+如果希望在 Mac 锁屏或后台运行时服务不中断，请使用我们提供的脚本：
+
+```bash
+# 1. 赋予执行权限
+chmod +x start_services.sh
+
+# 2. 启动服务 (同时启动 RSS Agent 和 cpolar)
+./start_services.sh
+```
+
+- 该脚本会自动使用 `caffeinate` 防止休眠
+- 日志输出到 `service.log` 和 `cpolar.log`
+- 停止服务：`pkill -f "python lark_service.py"; pkill -f "cpolar http"`
+- **👀 实时查看日志**：
+  ```bash
+  tail -f service.log
+  ```
+
 ## 📖 使用指南
 
 1. **订阅领域**：发送 `订阅 AI`

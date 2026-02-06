@@ -38,6 +38,7 @@ class AgentState(TypedDict):
 
     # 控制流标志
     intent: Optional[str] # write / read / chat
+    force_refresh: Optional[bool] # [新增] 是否强制刷新
 
 
 class RouterDecision(BaseModel):
@@ -131,23 +132,54 @@ def saver_node(state: AgentState):
     res = upsert_preference(state["user_id"], extracted_category)
     
     # 4. 返回动态消息
-    return {"messages": [AIMessage(content=f"已为您关注板块：【{extracted_category}】\n\n发送“看新闻”即可获取该板块动态。")]}
+    return {"messages": [AIMessage(content=f"已关注：【{extracted_category}】板块，每日自动为您推送\n\n点击“当日{extracted_category}新闻”，即可获取今日动态。")]}
 
 
 
 def fetcher_node(state: AgentState):
-    """读取偏好 -> 抓取新闻"""
+    """
+    负责获取新闻数据：
+    1. 先检查数据库缓存 (除非 force_refresh=True)
+    2. 如果无缓存，调用 Tool 抓取 RSS
+    """
     print("🕵️ [Fetcher] Node started")
     pref = get_preference(state["user_id"])
     if not pref:
         print("⚠️ [Fetcher] No preference found")
         return {
             "user_preference": None, 
-            "messages": [AIMessage(content="您还没有订阅任何内容，请发送 '订阅 AI'")]
+            "messages": [AIMessage(content="您还没有订阅任何内容，请发送 '订阅 AI'，'订阅 MUSIC'，或者'订阅 GAMES")]
         }
     
+    # 1. 尝试从数据库读取今日已生成的缓存
+    today = date.today().isoformat()
+    # 注意：get_cached_news 返回 {"content": str, "briefing_data": str/json, "generated_at": str}
+    
+    # 策略：如果有缓存且非强制刷新，我们直接返回缓存
+    if not state.get("force_refresh"):
+        cached = get_cached_news(pref, today)
+        if cached and cached.get("briefing_data"):
+            print(f"✅ [Fetcher] Found cached data for {pref}. generated_at={cached.get('generated_at')}")
+            try:
+                briefing_json = json.loads(cached["briefing_data"])
+                return {
+                    "user_preference": pref, 
+                    "news_content": None, 
+                    "briefing_data": briefing_json,
+                    "generated_at": cached.get("generated_at")
+                }
+            except Exception as e:
+                print(f"⚠️ [Fetcher] Cache parse failed: {e}")
+                pass
+    else:
+        print(f"🔄 [Fetcher] Force refresh enabled. Skipping cache check.")
+
+    # 2. 无缓存或强制刷新，执行实时抓取
+    # 2. 无缓存或强制刷新，执行实时抓取
     print(f"🌍 [Fetcher] Fetching news for: {pref}")
+    
     news_data = fetch_news(pref)
+    
     print(f"✅ [Fetcher] Got data (length: {len(str(news_data))})")
     return {"user_preference": pref, "news_content": json.dumps(news_data, ensure_ascii=False)}
 
@@ -171,17 +203,38 @@ def writer_node(state: AgentState):
     news_json = state.get("news_content")
     category = state.get("user_preference", "未知领域")
     
+    # 策略 0: 如果 State 中已有 briefing_data (来自 Cache)，直接使用
+    if state.get("briefing_data"):
+        try:
+            print(f"⏩ [Writer] Using cached briefing data for {category}")
+            # Pydantic 还原
+            briefing = NewsBriefing(**state["briefing_data"])
+            
+            # 构建卡片 (传入 generated_at 和 category)
+            card_content = build_cover_card(briefing, generated_at=state.get("generated_at"), category=category)
+            
+            return {
+                "briefing_data": state["briefing_data"], 
+                "messages": [AIMessage(content=card_content)]
+            }
+        except Exception as e:
+            print(f"⚠️ [Writer] Failed to reuse cache: {e}, falling back to generation")
+            # 失败了则继续往下执行生成逻辑
+    
+    # 策略 1: 如果没有 News Content (这不应该发生，Fetcher 应该处理了)，报错
     if not news_json:
-        print("❌ [Writer] No news content")
-        return {"messages": [AIMessage(content="未获取到新闻数据。")]}
+        return {"messages": [AIMessage(content="未能获取新闻数据")]}
         
     system_prompt = f"""你是一个资深的行业情报分析师。用户的订阅偏好是：{category}。
-    请阅读输入的新闻 JSON 数据，进行以下处理：
-    1. **去重**：合并内容雷同的新闻。
-    2. **聚类**：将新闻归类为 3-5 个核心板块（Cluster），如 "硬件"、"监管"、"应用"。
+    请阅读输入的新闻 JSON 数据，运用你的专业洞察力，进行以下处理：
+
+    1. **去重与清洗**：合并雷同新闻，剔除无关噪音。
+    2. **聚类**：将新闻归类为 3-5 个核心板块（Cluster）。
     3. **打分**：为每条新闻打分 (1-100)。
-    4. **Top 5**：挑选出最重要的 5 条新闻。
-    5. **综述**：写一段全局的行业趋势分析。
+    4. **综述 (Global Summary)**：
+       - **必需**：通读所有新闻，写一段 **犀利、具体、直击要害** 的情报综述，长度在200中文字符左右。
+       - **禁止**：套话（如“行业稳步发展”）、废话（如“值得关注”）、笼统描述。
+       - **要求**：必须提及具体的公司名、产品名、核心争端或关键数据。定性与定量结合，文字和数字结合，要点清晰，直接告诉用户“今天发生了什么大事，意味着什么”。
     
     请严格输出符合 NewsBriefing 结构的 JSON。
     **重要**：
@@ -195,8 +248,8 @@ def writer_node(state: AgentState):
     ])
     
     print("🧠 [Writer] Invoking LLM for Structured Output...")
-    # 切换回 llm_fast (Gemini)，因为它在 JSON 格式遵循上更稳定
-    structured_llm = llm_fast.with_structured_output(NewsBriefing) 
+    # 切换到 llm_reasoning (Claude 3.5 Sonnet / DeepSeek R1) 以获得最佳写作质量
+    structured_llm = llm_reasoning.with_structured_output(NewsBriefing) 
     chain = prompt | structured_llm
     
     try:
@@ -204,7 +257,7 @@ def writer_node(state: AgentState):
         print(f"✅ [Writer] Briefing Generated. Clusters: {[c.name for c in briefing.clusters]}")
         
         # 1. 构建飞书交互卡片
-        card_content = build_cover_card(briefing)
+        card_content = build_cover_card(briefing, category=category)
         
         # 2. 返回结果
         # 注意：我们需要标记这是一张卡片，而不是普通文本
@@ -222,16 +275,53 @@ def writer_node(state: AgentState):
 
 
 # --- 详情展示节点 ---
+
+from database import get_cached_news # Import at top or inside if circular
+from datetime import date, timedelta # [新增] timedelta
+from database import get_cached_news
+
+# --- 详情展示节点 ---
 def detail_node(state: AgentState):
     """
-    接收用户选择的板块名 -> 从 State 缓存中查找新闻 -> 渲染详情
+    接收用户选择的板块名 -> 从 State 缓存或数据库中查找新闻 -> 渲染详情
     """
     print("🔍 [Detail] Node started")
     selected_cluster = state.get("selected_cluster") # 使用专门的字段
     briefing_dump = state.get("briefing_data")
     
+    # 策略 1: 尝试从 State 获取 (如果是同一会话)
+    # 策略 2: 尝试从数据库获取 (如果是跨会话点击)
+    if not briefing_dump:
+        print(f"⚠️ [Detail] State missing briefing_data, searching DB for cluster: {selected_cluster}")
+        today = date.today().isoformat()
+        categories = ["AI", "GAMES", "MUSIC", "SHORT_DRAMA"] # 已知类别
+        
+        for cat in categories:
+            cached = get_cached_news(cat, today)
+            # get_cached_news 返回 {"content": str, "briefing_data": str}
+            if cached and cached.get("briefing_data"):
+                try:
+                    data_json = json.loads(cached["briefing_data"])
+                    # 检查 cluster 是否在这里
+                    # 简单检查：直接看 briefing_data 字符串里有没有 cluster 名字？
+                    # 或者解析后通过 Pydantic 检查
+                    # 为求稳，我们先尝试解析
+                    # 注意：NewsBriefing 结构是 global_summary, clusters
+                    # 这里是一个 dict
+                    clusters_data = data_json.get("clusters", [])
+                    for c in clusters_data:
+                        if c.get("name") and (selected_cluster in c["name"] or c["name"] in selected_cluster):
+                            print(f"✅ [Detail] Found cluster in DB category: {cat}")
+                            briefing_dump = data_json
+                            break
+                except Exception as e:
+                    print(f"⚠️ [Detail] Parse DB cache failed for {cat}: {e}")
+            
+            if briefing_dump:
+                break
+    
     if not briefing_dump or not selected_cluster:
-        return {"messages": [AIMessage(content="⚠️ 抱歉，早报数据已过期或未找到。请重新发送 '看新闻' 获取最新早报。")]}
+        return {"messages": [AIMessage(content=f"⚠️ 未找到板块：{selected_cluster}。\n\n数据可能已更新过期，请发送“生成日报”获取最新资讯。")]}
     
     # 恢复 Pydantic 对象
     try:
@@ -257,6 +347,7 @@ def detail_node(state: AgentState):
         msg += f"{item.summary}\n\n"
     
     return {"messages": [AIMessage(content=msg)]}
+
 
 
 # --- 组装图谱 (The Map) ---

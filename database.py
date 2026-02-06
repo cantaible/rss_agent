@@ -33,6 +33,15 @@ def init_db():
     
     conn.commit()
     conn.close()
+    
+    # 尝试添加 briefing_data 列 (如果已存在则忽略)
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        conn.execute('ALTER TABLE daily_news_cache ADD COLUMN briefing_data TEXT')
+        print("✅ Added column 'briefing_data' to daily_news_cache.")
+    except sqlite3.OperationalError:
+        pass # 列已存在
+    conn.close()
     print("✅ Database initialized.")
 
 def upsert_preference(user_id: str, category: str):
@@ -59,25 +68,36 @@ def get_preference(user_id: str):
     conn.close()
     return row[0] if row else None
 
-def save_cached_news(category, content, date_str):
-    """保存新闻缓存"""
+def save_cached_news(category, content, date_str, briefing_data=None):
+    """保存新闻缓存 (含原始数据)"""
     conn = sqlite3.connect(DB_FILE)
+    # Note: briefing_data might be None if saving from legacy logic, handle gracefully?
+    # Actually we should enforce it ideally, but let's default to empty JSON '{}' or None
+    if briefing_data is None: 
+        briefing_data = "{}"
+        
     conn.execute('''
-        INSERT OR REPLACE INTO daily_news_cache (category, content, generated_at, date)
-        VALUES (?, ?, ?, ?)
-    ''', (category, content, datetime.now(), date_str))
+        INSERT OR REPLACE INTO daily_news_cache (category, content, generated_at, date, briefing_data)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (category, content, datetime.now(), date_str, briefing_data))
     conn.commit()
     conn.close()
 
 def get_cached_news(category, date_str):
-    """读取新闻缓存"""
+    """读取新闻缓存 -> (content, briefing_data)"""
     conn = sqlite3.connect(DB_FILE)
     row = conn.execute(
-        'SELECT content FROM daily_news_cache WHERE category = ? AND date = ?',
+        'SELECT content, briefing_data, generated_at FROM daily_news_cache WHERE category = ? AND date = ?',
         (category, date_str)
     ).fetchone()
     conn.close()
-    return row[0] if row else None
+    if row:
+        return {
+            "content": row[0],
+            "briefing_data": row[1],
+            "generated_at": row[2] # 新增
+        }
+    return None
 
 if __name__ == "__main__":
     init_db()
