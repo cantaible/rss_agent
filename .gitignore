@@ -7,3 +7,4 @@ rss_agent.db
 *.zip
 .vscode/
 .idea/
+cpolar.log

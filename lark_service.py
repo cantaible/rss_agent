@@ -3,6 +3,7 @@ from fastapi import FastAPI
 import uvicorn
 import json
 from fastapi import BackgroundTasks, Request
+from contextlib import asynccontextmanager
 
 from agent_graph import graph
 from langchain_core.messages import HumanMessage
@@ -11,7 +12,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import date
-from database import save_cached_news, get_cached_news, DB_FILE, upsert_preference
+from database import save_cached_news, get_cached_news, DB_FILE, upsert_preference, init_db
 import sqlite3
 import asyncio
 
@@ -85,11 +86,14 @@ def push_delivery_task():
             print(f"⚠️ [Delivery] No food ready for {user_id} (Cache miss)")
             # 可选：这里可以触发一次 generate_news_task() 作为补救
 
-# 创建一个 App 实例
-app = FastAPI()
+# 初始化数据库（在模块加载时立即执行，确保在任何模式下都会运行）
+print("📦 Initializing database...")
+init_db()
 
-@app.on_event("startup")
-def start_scheduler():
+# 使用 FastAPI 推荐的 lifespan 方式替代已废弃的 on_event
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     print("⏰ Starting Scheduler...")
     
     # 1. 厨师任务：8:00 - 22:00，每2小时做一次饭
@@ -104,6 +108,15 @@ def start_scheduler():
     scheduler.add_job(push_delivery_task, 'cron', hour=17, minute=46)
     
     scheduler.start()
+    
+    yield
+    
+    # Shutdown (如果需要清理资源)
+    print("🛑 Shutting down scheduler...")
+    scheduler.shutdown()
+
+# 创建一个 App 实例，使用 lifespan
+app = FastAPI(lifespan=lifespan)
 
 def run_agent(user_id, text, message_id=None, force_refresh=False):
     """运行 LangGraph Agent"""
