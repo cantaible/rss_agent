@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  rss-agent:
+    build: .
+    container_name: rss-agent
+    ports:
+      - "36000:36000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - LLM_FAST_MODEL=${LLM_FAST_MODEL}
+      - LLM_REASONING_MODEL=${LLM_REASONING_MODEL}
+      - LARK_APP_ID=${LARK_APP_ID}
+      - LARK_APP_SECRET=${LARK_APP_SECRET}
+    volumes:
+      # 持久化数据库文件
+      - ./data:/app/data
+      # 如果需要修改代码后自动重载，可以挂载代码目录（生产环境不推荐）
+      # - .:/app
+    restart: unless-stopped
+    # 健康检查
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:36000/" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

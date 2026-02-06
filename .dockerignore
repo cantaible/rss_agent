@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Logs
+*.log
+service.log
+cpolar.log
+
+# Database (will be mounted as volume)
+*.db
+
+# Environment variables (will be provided at runtime)
+.env
+
+# Misc
+cpolar-macos-arm64.zip
+.DS_Store
