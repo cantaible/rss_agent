@@ -1,7 +1,9 @@
 import sqlite3
 from datetime import datetime
+import os
 
-DB_FILE = "rss_agent.db"
+# 使用 volume 挂载的 data 目录，确保数据持久化
+DB_FILE = os.path.join("/app/data", "rss_agent.db")
 
 def init_db():
     """初始化数据库，创建必要的表"""

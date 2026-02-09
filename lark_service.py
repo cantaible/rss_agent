@@ -28,19 +28,20 @@ scheduler = BackgroundScheduler(timezone=beijing_tz)
 from config import DAILY_NEWS_CATEGORIES
 
 def generate_news_task(force=True):
-    """👨‍🍳 厨师任务：每隔2小时（或启动时）生成新闻并存入数据库（不推送）"""
+    """
+    👨‍🍳 厨师任务：每隔2小时（或启动时）生成新闻并存入数据库（不推送）
+    
+    改进：直接从 config.py 读取类别，作为参数传递给 agent，不依赖数据库查询
+    """
     today = date.today().isoformat()
-    # conn = sqlite3.connect(DB_FILE)
-    # users = conn.execute("SELECT user_id, category FROM user_preferences").fetchall()
-    # conn.close()
     
     print(f"👨‍🍳 [Chef] Starting news generation (Force={force}) for categories: {DAILY_NEWS_CATEGORIES}...")
-    
-    # 之前是遍历所有用户 user_preferences，现在改为遍历固定的类别
-    # 使用一个固定的 system_daily_bot 作为 user_id，确保生成逻辑一致
-    system_user_id = "system_daily_bot"
 
     for category in DAILY_NEWS_CATEGORIES:
+        # 关键修复：每个类别使用独立的 thread_id，避免 LangGraph state 污染
+        # 例如: system_daily_bot_AI, system_daily_bot_GAMES, system_daily_bot_MUSIC
+        category_user_id = f"system_daily_bot_{category}"
+        
         # 如果不是强制刷新 (即 Startup 模式)，先检查是否已有饭菜
         if not force:
             cached = get_cached_news(category, today)
@@ -49,9 +50,15 @@ def generate_news_task(force=True):
                 continue
 
         try:
-            # 1. 生成 (模仿用户指令)
-            # 关键：传入 force_refresh=True，强制厨师炒新菜，不要吃剩饭
-            content, briefing_data = run_agent(system_user_id, f"看关于{category}的新闻", force_refresh=True)
+            # 1. 生成新闻
+            # 关键改动：直接传入 user_preference=category，跳过 router 解析和数据库查询
+            # force_refresh=True 强制重新抓取新闻，不使用缓存
+            content, briefing_data = run_agent(
+                user_id=category_user_id,  # ← 使用独立的 thread_id
+                text="生成日报",  # 文本不再重要，仅作占位
+                force_refresh=True,
+                user_preference=category  # 直接传入类别！
+            )
             
             # 2. 存根
             if briefing_data:
@@ -86,31 +93,29 @@ def push_delivery_task():
             print(f"⚠️ [Delivery] No food ready for {user_id} (Cache miss)")
             # 可选：这里可以触发一次 generate_news_task() 作为补救
 
-# 初始化数据库（在模块加载时立即执行，确保在任何模式下都会运行）
-print("📦 Initializing database...")
-init_db()
-
-# 启动调度器（在模块加载时立即执行）
-print("⏰ Starting Scheduler...")
-from datetime import datetime, timedelta
-
-# 1. 厨师任务：北京时间 8:00 - 22:00，每2小时做一次饭
-scheduler.add_job(generate_news_task, 'cron', hour='8-22/2', minute=0, timezone=beijing_tz)
-
-# 2. 也是厨师任务：刚开业（启动服务）时先做一顿
-# 关键：这里 force=False，如果数据库里已经有菜了，就不重做了 (避免热重载时疯狂生成)
-scheduler.add_job(generate_news_task, 'date', run_date=datetime.now(beijing_tz) + timedelta(seconds=5), kwargs={"force": False})
-
-# 3. 外卖员任务：北京时间每天 10:10 准时送餐
-scheduler.add_job(push_delivery_task, 'cron', hour=10, minute=10, timezone=beijing_tz)
-
-scheduler.start()
-print(f"✅ Scheduler started with timezone: {beijing_tz}")
-
-# 使用 FastAPI 推荐的 lifespan 方式（用于优雅关闭）
+# 使用 FastAPI 推荐的 lifespan 方式（用于优雅关闭和避免重复初始化）
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup - 只在 worker 进程中执行（避免 reload 模式下的重复初始化）
+    print("📦 Initializing database...")
+    init_db()
+    
+    print("⏰ Starting Scheduler...")
+    from datetime import datetime, timedelta
+    
+    # 1. 厨师任务：北京时间 8:00 - 22:00，每2小时做一次饭
+    scheduler.add_job(generate_news_task, 'cron', hour='8-22/2', minute=0, timezone=beijing_tz)
+    
+    # 2. 也是厨师任务：刚开业（启动服务）时先做一顿
+    # 关键：这里 force=False，如果数据库里已经有菜了，就不重做了 (避免热重载时疯狂生成)
+    scheduler.add_job(generate_news_task, 'date', run_date=datetime.now(beijing_tz) + timedelta(seconds=5), kwargs={"force": False})
+    
+    # 3. 外卖员任务：北京时间每天 10:10 准时送餐
+    scheduler.add_job(push_delivery_task, 'cron', hour=10, minute=10, timezone=beijing_tz)
+    
+    scheduler.start()
+    print(f"✅ Scheduler started with timezone: {beijing_tz}")
+    
     yield
     
     # Shutdown (优雅关闭调度器)
@@ -120,8 +125,17 @@ async def lifespan(app: FastAPI):
 # 创建一个 App 实例，使用 lifespan
 app = FastAPI(lifespan=lifespan)
 
-def run_agent(user_id, text, message_id=None, force_refresh=False):
-    """运行 LangGraph Agent"""
+def run_agent(user_id, text, message_id=None, force_refresh=False, user_preference=None):
+    """
+    运行 LangGraph Agent
+    
+    参数:
+        user_id: 用户ID
+        text: 用户输入文本
+        message_id: 消息ID（用于回复）
+        force_refresh: 是否强制刷新缓存
+        user_preference: 直接指定用户偏好类别（定时任务专用，跳过 router 和数据库查询）
+    """
     config = {"configurable": {"thread_id": user_id}}
     
     # 获取历史消息（用于聊天模式的上下文记忆）
@@ -139,7 +153,8 @@ def run_agent(user_id, text, message_id=None, force_refresh=False):
         "messages": recent_history + [HumanMessage(content=text)], 
         "user_id": user_id,
         "message_id": message_id,
-        "force_refresh": force_refresh # [新增] 控制是否强制刷新
+        "force_refresh": force_refresh, # [新增] 控制是否强制刷新
+        "user_preference": user_preference # [新增] 直接传入偏好类别
     }
     
     # 传入 thread_id 以启用 state 持久化（每个用户独立存储）

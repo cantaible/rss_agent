@@ -57,7 +57,16 @@ import json
 from langchain_core.prompts import ChatPromptTemplate
 
 def router_node(state: AgentState):
-    """进阶版意图识别：使用 LLM 结构化输出 + 容错兜底"""
+    """
+    进阶版意图识别：使用 LLM 结构化输出 + 容错兜底
+    
+    新增：如果 state 中已有 user_preference（定时任务传入），直接返回 read 意图，跳过 LLM 解析
+    """
+    # --- 拦截器 0: 定时任务绕行通道 (scheduler 专用) ---
+    if state.get("user_preference"):
+        print(f"⚡ [Router] Scheduler mode detected, preference={state['user_preference']}, skipping LLM")
+        return {"intent": "read"}  # 直接返回 read 意图，user_preference 保持不变
+    
     last_message = state["messages"][-1].content
     print(f"🚦 Router handling message: {last_message}")
     
@@ -139,16 +148,32 @@ def saver_node(state: AgentState):
 def fetcher_node(state: AgentState):
     """
     负责获取新闻数据：
-    1. 先检查数据库缓存 (除非 force_refresh=True)
-    2. 如果无缓存，调用 Tool 抓取 RSS
+    支持两种模式：
+    1. 【定时任务模式】state 中已有 user_preference（直接从 config 传入）→ 使用该值
+    2. 【用户交互模式】state 中无 user_preference → 从数据库查询用户订阅偏好
+    
+    然后检查缓存或抓取新闻：
+    - 先检查数据库缓存 (除非 force_refresh=True)
+    - 如果无缓存，调用 Tool 抓取 RSS
     """
     print("🕵️ [Fetcher] Node started")
-    pref = get_preference(state["user_id"])
+    
+    # 策略 1: 优先使用 State 中已存在的 user_preference（定时任务传入）
+    pref = state.get("user_preference")
+    
+    # 策略 2: 如果 State 中没有，则从数据库查询（用户交互场景）
     if not pref:
-        print("⚠️ [Fetcher] No preference found")
+        print("🔍 [Fetcher] No preference in state, querying database...")
+        pref = get_preference(state["user_id"])
+    else:
+        print(f"✅ [Fetcher] Using preference from state: {pref}")
+    
+    # 策略 3: 如果两者都没有，返回提示
+    if not pref:
+        print("⚠️ [Fetcher] No preference found in state or database")
         return {
             "user_preference": None, 
-            "messages": [AIMessage(content="您还没有订阅任何内容，请发送 '订阅 AI'，'订阅 MUSIC'，或者'订阅 GAMES")]
+            "messages": [AIMessage(content="您还没有订阅任何内容，请发送 '订阅 AI'，'订阅 MUSIC'，或者'订阅 GAMES'")]
         }
     
     # 1. 尝试从数据库读取今日已生成的缓存
