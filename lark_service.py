@@ -14,6 +14,10 @@ from database import save_cached_news, get_cached_news, DB_FILE, upsert_preferen
 import sqlite3
 import asyncio
 from pytz import timezone
+from collections import deque
+
+# 事件去重队列
+processed_events = deque(maxlen=100)
 
 # 初始化调度器（使用北京时区）
 beijing_tz = timezone('Asia/Shanghai')
@@ -111,7 +115,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(generate_news_task, 'date', run_date=datetime.now(beijing_tz) + timedelta(seconds=5), kwargs={"force": False})
     
     # 3. 外卖员任务：北京时间每天 10:10 准时送餐
-    scheduler.add_job(push_delivery_task, 'cron', hour=10, minute=10, timezone=beijing_tz)
+    scheduler.add_job(push_delivery_task, 'cron', hour=9, minute=10, timezone=beijing_tz)
     
     scheduler.start()
     print(f"✅ Scheduler started with timezone: {beijing_tz}")
@@ -199,7 +203,17 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
     print(f"Request type: {body.get('type')}")
     print(f"Event type: {body.get('header', {}).get('event_type')}")
     print(f"Full body keys: {list(body.keys())}")
+    print(f"Full body keys: {list(body.keys())}")
     print(f"{'='*60}\n")
+    
+    # 0. 去重处理 (防止飞书超时重试导致二次触发)
+    event_id = body.get("header", {}).get("event_id")
+    if event_id and event_id in processed_events:
+        print(f"⏩ [Event] Duplicate event {event_id}, skipping.")
+        return {"code": 0}
+    
+    if event_id:
+        processed_events.append(event_id)
     
     # 1. 握手验证
     if body.get("type") == "url_verification":
@@ -228,6 +242,31 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
             # 但这里没有 reply token，通常直接调 send_message
             from messaging import send_message
             send_message(operator_id, f"✅ 已成功订阅 **{category}** 类别！\n我们将为您推送该类别的每日早报。")
+
+        # 2. 新增：处理手动触发新闻请求
+        elif event_key in ["REQUEST_MUSIC_NEWS", "REQUEST_GAMES_NEWS", "REQUEST_AI_NEWS"]:
+            # 提取类别: REQUEST_MUSIC_NEWS -> MUSIC
+            target_category = event_key.split("_")[1] 
+            print(f"🔍 [Menu] 用户 {operator_id} 请求获取：{target_category} 新闻")
+            
+            from datetime import date
+            today = date.today().isoformat()
+            cached = get_cached_news(target_category, today)
+            
+            from messaging import send_message
+            if cached and cached.get("content"):
+                send_message(operator_id, cached["content"])
+            else:
+                send_message(operator_id, f"ℹ️ 抱歉，今天的【{target_category}】日报暂未生成。\n请稍后再试，或等待每日定时推送。")
+
+        # 3. 新增：测试归档到 Wiki
+        elif event_key == "WRITE_DAILY_NEWS":
+             print(f"📝 [Menu] 用户 {operator_id} 请求：归档日报到 Wiki")
+             
+             from messaging import send_message
+             send_message(operator_id, "⏳ 正在将今日多类别日报归档至 Wiki，请稍候...")
+             
+             background_tasks.add_task(archive_daily_news_to_wiki, operator_id)
 
     # 3. 处理卡片交互 (Card Action)
     # 当用户点击卡片按钮时触发
@@ -267,6 +306,61 @@ async def handle_card_action_async(user_id, text, message_id, target):
     # 后台慢慢处理（无3秒限制）
     ai_reply_content, _ = run_agent(user_id, text, message_id)
     reply_message(message_id, ai_reply_content)
+
+async def archive_daily_news_to_wiki(user_id):
+    """
+    后台任务：将今日日报归档到 Wiki
+    """
+    try:
+        from doc_writer import FeishuDocWriter
+        import os
+        from config import WIKI_TOKEN
+        
+        app_id = os.getenv("LARK_APP_ID")
+        app_secret = os.getenv("LARK_APP_SECRET")
+        # 目标文档: WIKI_TOKEN 已从 config 导入 
+        
+        if not app_id or not app_secret:
+            print("❌ 缺少 LARK_APP_ID 或 LARK_APP_SECRET 环境变量")
+            return
+
+        print(f"📂 [Archiver] Starting archive task for user {user_id}...")
+        
+        # 1. 准备数据
+        today = date.today().isoformat()
+        categories = ["AI", "GAMES", "MUSIC"]
+        all_news_data = {}
+        
+        for cat in categories:
+            cached = get_cached_news(cat, today)
+            items = []
+            if cached and cached.get("briefing_data"):
+                try:
+                    # 数据库里存的是 JSON string
+                    items = json.loads(cached["briefing_data"])
+                except Exception as e:
+                    print(f"⚠️ 解析 {cat} 数据失败: {e}")
+            
+            all_news_data[cat] = items
+            
+        # 2. 执行写入
+        writer = FeishuDocWriter(app_id, app_secret)
+        success = writer.write_daily_news_to_wiki(WIKI_TOKEN, all_news_data)
+        
+        # 3. 反馈用户
+        from messaging import send_message
+        if success:
+            msg = f"✅ 归档成功！\n请查看文档： https://bytedance.larkoffice.com/wiki/{WIKI_TOKEN}"
+            print("✅ [Archiver] Archive success.")
+        else:
+            msg = "❌ 归档失败，请检查后台日志。"
+            print("❌ [Archiver] Archive failed.")
+            
+        send_message(user_id, msg)
+        
+    except Exception as e:
+        print(f"❌ [Archiver] Exception: {e}")
+
 
 if __name__ == "__main__":
     # 启动服务器：

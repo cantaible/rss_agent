@@ -8,3 +8,5 @@ rss_agent.db
 .vscode/
 .idea/
 cpolar.log
+/bot写入文档
+*.log
