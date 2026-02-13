@@ -3,7 +3,6 @@
 用于将机器人生内容写入飞书云文档（支持Wiki）
 """
 import requests
-import json
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -11,6 +10,9 @@ class FeishuDocWriter:
     """飞书文档写入器"""
     
     BASE_URL = "https://open.larkoffice.com/open-apis"
+    MAX_CHILDREN_PER_REQUEST = 50
+    SUMMARY_MAX_LEN = 180
+    DESCRIPTION_MAX_LEN = 220
     
     def __init__(self, app_id: str, app_secret: str):
         self.app_id = app_id
@@ -113,11 +115,38 @@ class FeishuDocWriter:
             result = response.json()
             if result.get("code") != 0:
                 print(f"❌ 写入Block失败: {result.get('msg')}")
+                field_violations = result.get("error", {}).get("field_violations")
+                if field_violations:
+                    print(f"❌ 字段校验详情: {field_violations}")
                 return False
             return True
         except Exception as e:
             print(f"❌ 写入Block异常: {e}")
             return False
+
+    def append_blocks_in_batches(
+        self,
+        document_id: str,
+        children: List[Dict[str, Any]],
+        index: int = -1,
+        batch_size: int = MAX_CHILDREN_PER_REQUEST
+    ) -> bool:
+        """分批写入，避免单次 children 超过飞书接口上限。"""
+        if not children:
+            return True
+
+        current_index = index
+        total = len(children)
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            chunk = children[start:end]
+            chunk_index = current_index if current_index != -1 else -1
+            print(f"🧩 写入批次 {start // batch_size + 1}: blocks {start + 1}-{end}/{total}")
+            if not self.append_blocks(document_id, chunk, index=chunk_index):
+                return False
+            if current_index != -1:
+                current_index += len(chunk)
+        return True
 
     def create_heading_block(self, text: str, level: int = 1) -> Dict:
         """构建标题Block"""
@@ -132,13 +161,80 @@ class FeishuDocWriter:
 
     def create_text_block(self, text: str) -> Dict:
         """构建普通文本Block"""
+        return self.create_rich_text_block([{"text_run": {"content": text}}])
+
+    def create_rich_text_block(self, elements: List[Dict[str, Any]]) -> Dict:
+        """构建富文本Block"""
         return {
             "block_type": 2,
             "text": {
-                "elements": [{"text_run": {"content": text}}],
+                "elements": elements,
                 "style": {}
             }
         }
+
+    @staticmethod
+    def truncate_text(text: Any, max_len: int) -> str:
+        if text is None:
+            return ""
+        clean_text = str(text).strip()
+        if len(clean_text) <= max_len:
+            return clean_text
+        return f"{clean_text[:max_len].rstrip()}..."
+
+    @staticmethod
+    def safe_score(item: Dict[str, Any]) -> float:
+        raw_score = item.get("score", 0)
+        try:
+            return float(raw_score)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def safe_score_value(raw_score: Any) -> float:
+        try:
+            return float(raw_score)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def normalize_http_url(url: Any) -> str:
+        if not url:
+            return ""
+        cleaned = str(url).strip()
+        if cleaned.startswith("http://") or cleaned.startswith("https://"):
+            return cleaned
+        return ""
+
+    def create_news_item_block(
+        self,
+        idx: int,
+        title: Any,
+        summary: Any = "",
+        url: Any = "",
+        score: Any = None
+    ) -> Dict:
+        """构建新闻条目Block（标题支持链接）"""
+        safe_title = str(title).strip() if title else "无标题"
+        safe_summary = self.truncate_text(summary, self.SUMMARY_MAX_LEN)
+        safe_url = self.normalize_http_url(url)
+
+        title_run: Dict[str, Any] = {"content": safe_title}
+        if safe_url:
+            title_run["text_element_style"] = {"link": {"url": safe_url}}
+
+        line1 = f"{idx}. "
+        if score is not None:
+            line1 += f"[{self.safe_score_value(score):.0f}] "
+
+        elements: List[Dict[str, Any]] = [
+            {"text_run": {"content": line1}},
+            {"text_run": title_run}
+        ]
+        if safe_summary:
+            elements.append({"text_run": {"content": f"\n   摘要：{safe_summary}"}})
+
+        return self.create_rich_text_block(elements)
 
     def create_divider_block(self) -> Dict:
         """构建分割线Block"""
@@ -158,62 +254,103 @@ class FeishuDocWriter:
         if not document_id:
             return False
 
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_date = datetime.now().strftime("%Y-%m-%d")
         blocks_to_write = []
 
         # 2. 构建内容
         # 分割线（区分上一次写入）
         blocks_to_write.append(self.create_divider_block())
         
-        # 写入时间头
-        blocks_to_write.append(self.create_heading_block(f"🕒 自动归档 - {current_time}", level=2))
+        # 写入日期 H2
+        blocks_to_write.append(self.create_heading_block(current_date, level=2))
 
         # 遍历类别
         for category, briefing in all_categories_news.items():
-            # 类别标题
-            icon = "🤖" if category == "AI" else ("🎵" if category == "MUSIC" else "🎮")
-            blocks_to_write.append(self.create_heading_block(f"{icon} {category} 新闻", level=2))
+            # 赛道标题 H3
+            blocks_to_write.append(self.create_heading_block(str(category), level=3))
 
             if not briefing or not isinstance(briefing, dict):
-                blocks_to_write.append(self.create_text_block("（暂无数据）"))
+                blocks_to_write.append(self.create_text_block("暂无数据"))
                 continue
             
-            # 2.1 全局摘要
-            global_summary = briefing.get("global_summary")
-            if global_summary:
-                blocks_to_write.append(self.create_text_block(f"📝 综述：{global_summary}"))
+            # 2.1 今日综述
+            global_summary = self.truncate_text(briefing.get("global_summary"), self.SUMMARY_MAX_LEN)
+            blocks_to_write.append(
+                self.create_text_block(f"今日综述：{global_summary or '暂无数据'}")
+            )
 
-            # 2.2 遍历板块 (Clusters)
-            clusters = briefing.get("clusters", [])
-            if not clusters:
-                 blocks_to_write.append(self.create_text_block("（无板块数据）"))
-                 continue
+            clusters = briefing.get("clusters")
+            if not isinstance(clusters, list):
+                clusters = []
 
+            all_items: List[Dict[str, Any]] = []
             for cluster in clusters:
-                cluster_name = cluster.get("name", "未命名板块")
-                # H3 板块标题
-                blocks_to_write.append(self.create_heading_block(f"📌 {cluster_name}", level=3))
-                
-                items = cluster.get("items", [])
-                for i, news in enumerate(items, 1):
-                    # news 应该是 dict
-                    if not isinstance(news, dict):
-                         continue
-                         
-                    title = news.get("title", "无标题")
-                    link = news.get("url", "") # 注意 agent_graph 里是 url
-                    summary = news.get("summary", "")
+                if not isinstance(cluster, dict):
+                    continue
+                items = cluster.get("items")
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if isinstance(item, dict):
+                        all_items.append(item)
 
-                    # 格式：1. 标题
-                    #      🔗 链接
-                    #      摘要
-                    content = f"{i}. {title}"
-                    if link:
-                        content += f"\n   🔗 {link}"
-                    if summary:
-                        content += f"\n   {summary}"
-                    
-                    blocks_to_write.append(self.create_text_block(content))
+            # 2.2 Top 5（所有 cluster 扁平化后按 score 降序）
+            blocks_to_write.append(self.create_heading_block("Top 5", level=4))
+            if all_items:
+                top_items = sorted(all_items, key=self.safe_score, reverse=True)[:5]
+                for i, item in enumerate(top_items, 1):
+                    blocks_to_write.append(
+                        self.create_news_item_block(
+                            idx=i,
+                            title=item.get("title"),
+                            summary=item.get("summary"),
+                            url=item.get("url"),
+                            score=item.get("score"),
+                        )
+                    )
+            else:
+                blocks_to_write.append(self.create_text_block("暂无数据"))
+
+            # 2.3 深入专题（完整展示所有 cluster 内容）
+            blocks_to_write.append(self.create_heading_block("深入专题", level=4))
+            if not clusters:
+                blocks_to_write.append(self.create_text_block("暂无数据"))
+                continue
+
+            valid_cluster_count = 0
+            for cluster in clusters:
+                if not isinstance(cluster, dict):
+                    continue
+                valid_cluster_count += 1
+                cluster_name = str(cluster.get("name") or "未命名专题")
+                cluster_desc = self.truncate_text(
+                    cluster.get("description"), self.DESCRIPTION_MAX_LEN
+                )
+
+                blocks_to_write.append(self.create_heading_block(cluster_name, level=4))
+                if cluster_desc:
+                    blocks_to_write.append(self.create_text_block(f"专题综述：{cluster_desc}"))
+
+                cluster_items = cluster.get("items")
+                if not isinstance(cluster_items, list) or not cluster_items:
+                    blocks_to_write.append(self.create_text_block("暂无条目"))
+                    continue
+
+                for i, item in enumerate(cluster_items, 1):
+                    if not isinstance(item, dict):
+                        continue
+                    blocks_to_write.append(
+                        self.create_news_item_block(
+                            idx=i,
+                            title=item.get("title"),
+                            summary=item.get("summary"),
+                            url=item.get("url"),
+                            score=item.get("score"),
+                        )
+                    )
+
+            if valid_cluster_count == 0:
+                blocks_to_write.append(self.create_text_block("暂无数据"))
 
         # 3. 确定插入位置
         insert_index = self.find_first_callout_index(document_id)
@@ -222,5 +359,10 @@ class FeishuDocWriter:
         else:
             print(f"📝 将插入到索引 {insert_index} (高亮块之后)")
             
-        # 4. 写入
-        return self.append_blocks(document_id, blocks_to_write, index=insert_index)
+        # 4. 写入（分批，单批<=50）
+        return self.append_blocks_in_batches(
+            document_id=document_id,
+            children=blocks_to_write,
+            index=insert_index,
+            batch_size=self.MAX_CHILDREN_PER_REQUEST,
+        )

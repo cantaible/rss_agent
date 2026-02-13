@@ -314,7 +314,7 @@ async def archive_daily_news_to_wiki(user_id):
     try:
         from doc_writer import FeishuDocWriter
         import os
-        from config import WIKI_TOKEN
+        from config import WIKI_TOKEN, DAILY_NEWS_CATEGORIES
         
         app_id = os.getenv("LARK_APP_ID")
         app_secret = os.getenv("LARK_APP_SECRET")
@@ -328,20 +328,24 @@ async def archive_daily_news_to_wiki(user_id):
         
         # 1. 准备数据
         today = date.today().isoformat()
-        categories = ["AI", "GAMES", "MUSIC"]
+        categories = DAILY_NEWS_CATEGORIES
         all_news_data = {}
         
         for cat in categories:
             cached = get_cached_news(cat, today)
-            items = []
+            briefing = None
             if cached and cached.get("briefing_data"):
                 try:
                     # 数据库里存的是 JSON string
-                    items = json.loads(cached["briefing_data"])
+                    parsed = json.loads(cached["briefing_data"])
+                    if isinstance(parsed, dict):
+                        briefing = parsed
+                    else:
+                        print(f"⚠️ {cat} briefing_data 不是对象，已降级为暂无数据")
                 except Exception as e:
                     print(f"⚠️ 解析 {cat} 数据失败: {e}")
             
-            all_news_data[cat] = items
+            all_news_data[cat] = briefing
             
         # 2. 执行写入
         writer = FeishuDocWriter(app_id, app_secret)
@@ -368,4 +372,3 @@ if __name__ == "__main__":
     # port=8000 -> 监听 8000 端口
     # reload=True -> 你一改代码，服务器自动重启（方便开发）
     uvicorn.run("lark_service:app", host="0.0.0.0", port=36000, reload=True)
-
