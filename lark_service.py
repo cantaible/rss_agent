@@ -4,12 +4,13 @@ import uvicorn
 import json
 from fastapi import BackgroundTasks, Request
 from contextlib import asynccontextmanager
+import time
 
 from agent_graph import graph
 from langchain_core.messages import HumanMessage
 from messaging import reply_message
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import date
+from datetime import date, datetime, timezone as dt_timezone
 from database import save_cached_news, get_cached_news, DB_FILE, upsert_preference, init_db
 import sqlite3
 import asyncio
@@ -24,6 +25,22 @@ processed_events = deque(maxlen=100)
 beijing_tz = timezone('Asia/Shanghai')
 scheduler = BackgroundScheduler(timezone=beijing_tz)
 daily_archive_push_lock = threading.Lock()
+
+
+def _event_log(**fields):
+    """统一单行结构化日志，便于 grep/排查事件链路。"""
+    payload = {"ts": datetime.now(dt_timezone.utc).isoformat(timespec="milliseconds")}
+    payload.update(fields)
+    print(f"[EventLog] {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}")
+
+
+def _extract_operator_id(body):
+    event = body.get("event", {})
+    return (
+        event.get("operator", {}).get("operator_id", {}).get("open_id")
+        or event.get("operator", {}).get("open_id")
+        or event.get("sender", {}).get("sender_id", {}).get("open_id")
+    )
 
 # def pre_generate_daily_news():
 #     """(已弃用) 每天9点：预生成4个类别的早报"""
@@ -224,107 +241,164 @@ def process_lark_message(event_data):
 
 @app.post("/api/lark/event")
 async def handle_event(request: Request, background_tasks: BackgroundTasks):
-    # 解析原始 JSON
-    body = await request.json()
-    
-    # 🔍 调试日志：打印所有收到的请求
-    print(f"\n{'='*60}")
-    print(f"📨 [DEBUG] Received request")
-    print(f"Request type: {body.get('type')}")
-    print(f"Event type: {body.get('header', {}).get('event_type')}")
-    print(f"Full body keys: {list(body.keys())}")
-    print(f"Full body keys: {list(body.keys())}")
-    print(f"{'='*60}\n")
-    
-    # 0. 去重处理 (防止飞书超时重试导致二次触发)
-    event_id = body.get("header", {}).get("event_id")
-    if event_id and event_id in processed_events:
-        print(f"⏩ [Event] Duplicate event {event_id}, skipping.")
-        return {"code": 0}
-    
-    if event_id:
-        processed_events.append(event_id)
-    
-    # 1. 握手验证
-    if body.get("type") == "url_verification":
-        print("✅ [Verification] Responding to URL verification")
-        return {"challenge": body.get("challenge")}
-        
-    # 2. 处理用户消息 (Event v2 格式)
-    if body.get("header", {}).get("event_type") == "im.message.receive_v1":
-        print("📧 [Message] Processing user message")
-        # 放入后台运行，不阻塞 HTTP 返回
-        background_tasks.add_task(process_lark_message, body["event"])
+    started_at = time.perf_counter()
+    handled = False
+    event_id = None
 
-    # [新增] 处理菜单点击事件
-    elif body.get("header", {}).get("event_type") == "application.bot.menu_v6":
+    try:
+        # 解析原始 JSON
+        body = await request.json()
         event = body.get("event", {})
-        event_key = event.get("event_key", "") # e.g. "subscribe:AI"
-        operator_id = event.get("operator", {}).get("operator_id", {}).get("open_id")
-        
-        print(f"🔘 [Menu Event] Key: {event_key}, User: {operator_id}")
-        
-        if event_key.startswith("subscribe:"):
-            category = event_key.split(":")[1]
-            upsert_preference(operator_id, category)
-            
-            # 由于菜单点击没有 message_id 上下文，我们需要主动发消息给用户
-            # 但这里没有 reply token，通常直接调 send_message
-            from messaging import send_message
-            send_message(operator_id, f"✅ 已成功订阅 **{category}** 类别！\n我们将为您推送该类别的每日早报。")
+        event_type = body.get("header", {}).get("event_type")
+        request_type = body.get("type")
+        event_id = body.get("header", {}).get("event_id")
+        event_key = event.get("event_key")
+        operator_id = _extract_operator_id(body)
+        create_time = event.get("create_time")
+        client_ip = request.client.host if request.client else None
 
-        # 2. 新增：处理手动触发新闻请求
-        elif event_key in ["REQUEST_MUSIC_NEWS", "REQUEST_GAMES_NEWS", "REQUEST_AI_NEWS"]:
-            # 提取类别: REQUEST_MUSIC_NEWS -> MUSIC
-            target_category = event_key.split("_")[1] 
-            print(f"🔍 [Menu] 用户 {operator_id} 请求获取：{target_category} 新闻")
-            
-            from datetime import date
-            today = date.today().isoformat()
-            cached = get_cached_news(target_category, today)
-            
-            from messaging import send_message
-            if cached and cached.get("content"):
-                send_message(operator_id, cached["content"])
-            else:
-                send_message(operator_id, f"ℹ️ 抱歉，今天的【{target_category}】日报暂未生成。\n请稍后再试，或等待每日定时推送。")
+        _event_log(
+            log_type="event_in",
+            event_id=event_id,
+            event_type=event_type,
+            request_type=request_type,
+            event_key=event_key,
+            operator_id=operator_id,
+            create_time=create_time,
+            client_ip=client_ip,
+        )
 
-        # 3. 新增：测试归档到 Wiki
-        elif event_key == "WRITE_DAILY_NEWS":
-             print(f"📝 [Menu] 用户 {operator_id} 请求：归档日报到 Wiki")
-             
-             from messaging import send_message
-             send_message(operator_id, "⏳ 正在将今日多类别日报归档至 Wiki，请稍候...")
-             
-             background_tasks.add_task(archive_daily_news_to_wiki, operator_id)
+        # 🔍 调试日志：打印所有收到的请求
+        print(f"\n{'='*60}")
+        print(f"📨 [DEBUG] Received request")
+        print(f"Request type: {body.get('type')}")
+        print(f"Event type: {body.get('header', {}).get('event_type')}")
+        print(f"Full body keys: {list(body.keys())}")
+        print(f"Full body keys: {list(body.keys())}")
+        print(f"{'='*60}\n")
 
-    # 3. 处理卡片交互 (Card Action)
-    # 当用户点击卡片按钮时触发
-    elif body.get("header", {}).get("event_type") == "card.action.trigger":
-        # 从 event 对象中获取数据
-        event_data = body.get("event", {})
-        action_value = event_data.get("action", {}).get("value", {})
-        command = action_value.get("command")
-        target = action_value.get("target")
-        
-        # 构造模拟的文本指令，例如 "展开：硬件与算力"
-        if command == "expand" and target:
-            simulated_text = f"展开：{target}"
-            print(f"🃏 [Card Action] Received: {simulated_text}")
-            
-            # 获取用户和消息上下文信息
-            sender_id = event_data.get("operator", {}).get("open_id")
-            card_msg_id = event_data.get("context", {}).get("open_message_id")
-            
-            # 后台处理（不返回 Toast，避免3秒超时限制）
-            background_tasks.add_task(handle_card_action_async, sender_id, simulated_text, card_msg_id, target)
-            
-            # 返回成功响应，不显示 Toast
-            # code:0 表示成功，toast.type: info 显示一个小提示
-            # 如果不想显示任何提示，可以返回 {"code": 0}，或者 {"toast": {"type": "success", "content": "正在处理..."}}
-            return {"toast": {"type": "info", "content": "正在为您加载详情..."}}
-    
-    return {"code": 0}
+        # 0. 去重处理 (防止飞书超时重试导致二次触发)
+        if event_id and event_id in processed_events:
+            _event_log(log_type="event_dedup", dedup="hit", event_id=event_id)
+            print(f"⏩ [Event] Duplicate event {event_id}, skipping.")
+            handled = True
+            return {"code": 0}
+
+        _event_log(log_type="event_dedup", dedup="miss", event_id=event_id)
+        if event_id:
+            processed_events.append(event_id)
+
+        # 1. 握手验证
+        if body.get("type") == "url_verification":
+            print("✅ [Verification] Responding to URL verification")
+            handled = True
+            return {"challenge": body.get("challenge")}
+
+        # 2. 处理用户消息 (Event v2 格式)
+        if event_type == "im.message.receive_v1":
+            print("📧 [Message] Processing user message")
+            # 放入后台运行，不阻塞 HTTP 返回
+            background_tasks.add_task(process_lark_message, body["event"])
+            handled = True
+
+        # [新增] 处理菜单点击事件
+        elif event_type == "application.bot.menu_v6":
+            event_key = event.get("event_key", "")  # e.g. "subscribe:AI"
+            operator_id = event.get("operator", {}).get("operator_id", {}).get("open_id")
+
+            print(f"🔘 [Menu Event] Key: {event_key}, User: {operator_id}")
+
+            if event_key.startswith("subscribe:"):
+                _event_log(
+                    log_type="menu_branch",
+                    event_id=event_id,
+                    event_key=event_key,
+                    branch="subscribe",
+                )
+                category = event_key.split(":")[1]
+                upsert_preference(operator_id, category)
+
+                # 由于菜单点击没有 message_id 上下文，我们需要主动发消息给用户
+                # 但这里没有 reply token，通常直接调 send_message
+                from messaging import send_message
+
+                send_message(operator_id, f"✅ 已成功订阅 **{category}** 类别！\n我们将为您推送该类别的每日早报。")
+
+            # 2. 新增：处理手动触发新闻请求
+            elif event_key in ["REQUEST_MUSIC_NEWS", "REQUEST_GAMES_NEWS", "REQUEST_AI_NEWS"]:
+                _event_log(
+                    log_type="menu_branch",
+                    event_id=event_id,
+                    event_key=event_key,
+                    branch="request_news",
+                )
+                # 提取类别: REQUEST_MUSIC_NEWS -> MUSIC
+                target_category = event_key.split("_")[1]
+                print(f"🔍 [Menu] 用户 {operator_id} 请求获取：{target_category} 新闻")
+
+                from datetime import date
+                today = date.today().isoformat()
+                cached = get_cached_news(target_category, today)
+
+                from messaging import send_message
+                if cached and cached.get("content"):
+                    send_message(operator_id, cached["content"])
+                else:
+                    send_message(operator_id, f"ℹ️ 抱歉，今天的【{target_category}】日报暂未生成。\n请稍后再试，或等待每日定时推送。")
+
+            # 3. 新增：测试归档到 Wiki
+            elif event_key == "WRITE_DAILY_NEWS":
+                _event_log(
+                    log_type="menu_branch",
+                    event_id=event_id,
+                    event_key=event_key,
+                    branch="WRITE_DAILY_NEWS",
+                )
+                #  print(f"📝 [Menu] 用户 {operator_id} 请求：归档日报到 Wiki")
+                from messaging import send_message
+                #  send_message(operator_id, "⏳ 正在将今日多类别日报归档至 Wiki，请稍候...")
+                send_message(operator_id, "此功能不需要手动触发，查看历史日报请点击：历史新闻->日报汇总")
+
+                #  background_tasks.add_task(archive_daily_news_to_wiki, operator_id)
+
+            handled = True
+
+        # 3. 处理卡片交互 (Card Action)
+        # 当用户点击卡片按钮时触发
+        elif event_type == "card.action.trigger":
+            # 从 event 对象中获取数据
+            event_data = body.get("event", {})
+            action_value = event_data.get("action", {}).get("value", {})
+            command = action_value.get("command")
+            target = action_value.get("target")
+
+            # 构造模拟的文本指令，例如 "展开：硬件与算力"
+            if command == "expand" and target:
+                simulated_text = f"展开：{target}"
+                print(f"🃏 [Card Action] Received: {simulated_text}")
+
+                # 获取用户和消息上下文信息
+                sender_id = event_data.get("operator", {}).get("open_id")
+                card_msg_id = event_data.get("context", {}).get("open_message_id")
+
+                # 后台处理（不返回 Toast，避免3秒超时限制）
+                background_tasks.add_task(handle_card_action_async, sender_id, simulated_text, card_msg_id, target)
+
+                # 返回成功响应，不显示 Toast
+                # code:0 表示成功，toast.type: info 显示一个小提示
+                # 如果不想显示任何提示，可以返回 {"code": 0}，或者 {"toast": {"type": "success", "content": "正在处理..."}}
+                handled = True
+                return {"toast": {"type": "info", "content": "正在为您加载详情..."}}
+
+        return {"code": 0}
+    finally:
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        _event_log(
+            log_type="event_out",
+            event_id=event_id,
+            handled=handled,
+            latency_ms=latency_ms,
+        )
 
 async def handle_card_action_async(user_id, text, message_id, target):
     """处理卡片点击后的异步逻辑"""
