@@ -13,6 +13,7 @@ from datetime import date
 from database import save_cached_news, get_cached_news, DB_FILE, upsert_preference, init_db
 import sqlite3
 import asyncio
+import threading
 from pytz import timezone
 from collections import deque
 
@@ -22,6 +23,7 @@ processed_events = deque(maxlen=100)
 # 初始化调度器（使用北京时区）
 beijing_tz = timezone('Asia/Shanghai')
 scheduler = BackgroundScheduler(timezone=beijing_tz)
+daily_archive_push_lock = threading.Lock()
 
 # def pre_generate_daily_news():
 #     """(已弃用) 每天9点：预生成4个类别的早报"""
@@ -76,7 +78,7 @@ def generate_news_task(force=True):
             print(f"❌ [Chef] Failed for {category}: {e}")
 
 def push_delivery_task():
-    """🛵 外卖员任务：每天10:10准时推送最新的新闻"""
+    """🛵 外卖员任务：推送最新的新闻"""
     today = date.today().isoformat()
     conn = sqlite3.connect(DB_FILE)
     users = conn.execute("SELECT user_id, category FROM user_preferences").fetchall()
@@ -97,6 +99,24 @@ def push_delivery_task():
             print(f"⚠️ [Delivery] No food ready for {user_id} (Cache miss)")
             # 可选：这里可以触发一次 generate_news_task() 作为补救
 
+def daily_archive_and_push_job():
+    """统一定时任务：先归档，再推送。"""
+    if not daily_archive_push_lock.acquire(blocking=False):
+        print("⏩ [Scheduler] daily_archive_and_push_job is already running, skipping this trigger.")
+        return
+
+    try:
+        print("⏰ [Scheduler] Starting daily archive + push job...")
+        try:
+            asyncio.run(archive_daily_news_to_wiki(user_id=None, notify_user=False))
+        except Exception as e:
+            print(f"❌ [Scheduler] Archive step failed: {e}")
+
+        push_delivery_task()
+        print("✅ [Scheduler] Finished daily archive + push job.")
+    finally:
+        daily_archive_push_lock.release()
+
 # 使用 FastAPI 推荐的 lifespan 方式（用于优雅关闭和避免重复初始化）
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -114,8 +134,18 @@ async def lifespan(app: FastAPI):
     # 关键：这里 force=False，如果数据库里已经有菜了，就不重做了 (避免热重载时疯狂生成)
     scheduler.add_job(generate_news_task, 'date', run_date=datetime.now(beijing_tz) + timedelta(seconds=5), kwargs={"force": False})
     
-    # 3. 外卖员任务：北京时间每天 10:10 准时送餐
-    scheduler.add_job(push_delivery_task, 'cron', hour=9, minute=10, timezone=beijing_tz)
+    # 3. 统一任务：北京时间每天 09:10，先归档再推送
+    scheduler.add_job(
+        daily_archive_and_push_job,
+        'cron',
+        id='daily_archive_and_push_job',
+        hour=9,
+        minute=10,
+        timezone=beijing_tz,
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     
     scheduler.start()
     print(f"✅ Scheduler started with timezone: {beijing_tz}")
@@ -307,7 +337,7 @@ async def handle_card_action_async(user_id, text, message_id, target):
     ai_reply_content, _ = run_agent(user_id, text, message_id)
     reply_message(message_id, ai_reply_content)
 
-async def archive_daily_news_to_wiki(user_id):
+async def archive_daily_news_to_wiki(user_id=None, notify_user=True):
     """
     后台任务：将今日日报归档到 Wiki
     """
@@ -351,16 +381,19 @@ async def archive_daily_news_to_wiki(user_id):
         writer = FeishuDocWriter(app_id, app_secret)
         success = writer.write_daily_news_to_wiki(WIKI_TOKEN, all_news_data)
         
-        # 3. 反馈用户
-        from messaging import send_message
+        # 3. 反馈用户（定时任务可关闭通知）
         if success:
             msg = f"✅ 归档成功！\n请查看文档： https://bytedance.larkoffice.com/wiki/{WIKI_TOKEN}"
             print("✅ [Archiver] Archive success.")
         else:
             msg = "❌ 归档失败，请检查后台日志。"
             print("❌ [Archiver] Archive failed.")
-            
-        send_message(user_id, msg)
+
+        if notify_user and user_id:
+            from messaging import send_message
+            send_message(user_id, msg)
+        elif notify_user and not user_id:
+            print("ℹ️ [Archiver] notify_user=True but user_id is empty, skip sending message.")
         
     except Exception as e:
         print(f"❌ [Archiver] Exception: {e}")

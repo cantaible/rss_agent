@@ -3,23 +3,52 @@ from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field
 from typing import Literal
 
+# --- 长度控制常量（视觉宽度，1中文字=2英文字母） ---
+HEADLINE_LENGTH_MIN = 10  # 今日头条最短视觉宽度（中文字数）
+HEADLINE_LENGTH_MAX = 19  # 今日头条最长视觉宽度（中文字数）
+HEADLINE_LEN_MAX = 25     # 今日头条每条的字符数硬上限
+SUMMARY_LENGTH_MIN = 45   # 深度专题摘要最短视觉宽度（中文字数）
+SUMMARY_LENGTH_MAX = 60   # 深度专题摘要最长视觉宽度（中文字数）
+SUMMARY_LEN_MAX = 65      # 深度专题摘要的字符数硬上限
+HEADLINE_COUNT = 10    # 今日头条条数
+CLUSTER_ITEM_COUNT = 5 # 每个专题板块的新闻条数
+
+# --- 按赛道配置不同的深度专题板块 ---
+CATEGORY_CLUSTERS = {
+    "AI": [
+        ("产品", "新产品发布、产品更新、功能迭代"),
+        ("模型", "AI模型、算法、技术突破"),
+        ("硬件与算力", "芯片、GPU、服务器、云计算、算力基建"),
+        ("投融资与政策", "融资、收购、上市、政策法规、行业监管"),
+    ],
+    "GAMES": [
+        ("产品", "新游发布、版本更新、DLC、评测"),
+        ("生态", "电竞赛事、主播、玩家社区、游戏文化"),
+        ("商业", "厂商财报、收购并购、裁员、政策监管"),
+    ],
+    "MUSIC": [
+        ("产品", "新歌、新专辑、MV、榜单数据"),
+        ("生态", "演唱会、音乐节、艺人动态、厂牌签约"),
+        ("商业", "版权交易、流媒体平台、融资、行业政策"),
+    ],
+}
+
 # --- Pydantic Data Models (用于 Writer 结构化输出) ---
+class TopHeadline(BaseModel):
+    title: str = Field(..., description=f"一句话热点总结, 视觉宽度控制在{HEADLINE_LENGTH_MIN}-{HEADLINE_LENGTH_MAX}个中文字之间")
+    url: str = Field(..., description="对应新闻的原文链接")
+
 class NewsItem(BaseModel):
-    title: str = Field(..., description="新闻标题")
-    summary: str = Field(..., description="新闻摘要")
+    summary: str = Field(..., description=f"新闻摘要, 视觉宽度控制在{SUMMARY_LENGTH_MIN}-{SUMMARY_LENGTH_MAX}个中文字之间")
     url: str = Field(..., description="原文链接")
-    score: int = Field(..., description="重要性打分 1-100")
 
 class NewsCluster(BaseModel):
-    name: str = Field(..., description="板块名称，如'硬件与算力'")
-    description: str = Field(..., description="板块综述")
-    items: List[NewsItem] = Field(..., description="该板块下的新闻列表")
+    name: str = Field(..., description="板块名称, 根据赛道不同而不同")
+    items: List[NewsItem] = Field(..., description=f"该板块下的新闻列表, 约{CLUSTER_ITEM_COUNT}条")
 
 class NewsBriefing(BaseModel):
-    global_summary: str = Field(..., description="全篇早报的开场综述")
-    top_story_indices: List[int] = Field(None, description="今日头条新闻在 clusters 中的索引(暂不使用)")
-    # 注意：为了简化，Top 5 可以在展示层逻辑处理，或者直接取 clusters 里 score 最高的
-    clusters: List[NewsCluster] = Field(..., description="新闻分类板块")
+    headlines: List[TopHeadline] = Field(..., description=f"今日头条, 约{HEADLINE_COUNT}条最重要的热点新闻")
+    clusters: List[NewsCluster] = Field(..., description="深度专题分类板块")
 
 # --- Agent State ---
 class AgentState(TypedDict):
@@ -249,23 +278,40 @@ def writer_node(state: AgentState):
     # 策略 1: 如果没有 News Content (这不应该发生，Fetcher 应该处理了)，报错
     if not news_json:
         return {"messages": [AIMessage(content="未能获取新闻数据")]}
+
+    # 动态生成板块配置
+    cluster_config = CATEGORY_CLUSTERS.get(category, CATEGORY_CLUSTERS["AI"])
+    cluster_count = len(cluster_config)
+    cluster_desc = "\n".join(f"         - **{name}**：{desc}" for name, desc in cluster_config)
         
     system_prompt = f"""你是一个资深的行业情报分析师。用户的订阅偏好是：{category}。
     请阅读输入的新闻 JSON 数据，运用你的专业洞察力，进行以下处理：
 
     1. **去重与清洗**：合并雷同新闻，剔除无关噪音。
-    2. **聚类**：将新闻归类为 3-5 个核心板块（Cluster）。
-    3. **打分**：为每条新闻打分 (1-100)。
-    4. **综述 (Global Summary)**：
-       - **必需**：通读所有新闻，写一段 **犀利、具体、直击要害** 的情报综述，长度在200中文字符左右。
-       - **禁止**：套话（如“行业稳步发展”）、废话（如“值得关注”）、笼统描述。
-       - **要求**：必须提及具体的公司名、产品名、核心争端或关键数据。定性与定量结合，文字和数字结合，要点清晰，直接告诉用户“今天发生了什么大事，意味着什么”。
+
+    2. **今日头条 (headlines)**：
+       - 从所有新闻中提炼出最重要的 **{HEADLINE_COUNT} 条** 热点
+       - 每条热点用 **一句话总结**，按视觉宽度尽量控制长度：**1个中文字 = 2个英文字母/数字**，总视觉宽度必须在 **{HEADLINE_LENGTH_MIN}~{HEADLINE_LENGTH_MAX}个中文字** 之间，且总字符数（中英文加在一起）**不得超过{HEADLINE_LEN_MAX}个**
+       - 文字要 **犀利、具体、直击要害**，必须提及具体公司名、产品名或关键数据
+       - 标题要 **有吸引力**，能让人一眼看出新闻的价值
+       - 每条必须附带对应新闻的原文 URL
+       - **禁止**：套话、废话、笼统描述
+
+    3. **深度专题 (clusters)**：
+       - 将新闻 **固定** 归类到以下 {cluster_count} 个板块（即使某个板块暂无新闻，也保留空列表）：
+{cluster_desc}
+       - 每个板块约 **{CLUSTER_ITEM_COUNT} 条** 新闻摘要
+       - 每条摘要要 **有吸引力**，能让人一眼看出新闻的价值
+       - 每条摘要仅可能尝试按照三小句的格式进行写作：发生了什么，细节补充描述，有什么影响
+       - 每条摘要按视觉宽度尽量控制长度：**1个中文字 = 2个英文字母/数字**，总视觉宽度必须在 **{SUMMARY_LENGTH_MIN}~{SUMMARY_LENGTH_MAX}个中文字** 之间，且总字符数（中英文加在一起）**不得超过{SUMMARY_LEN_MAX}个**，信息密度高，直击核心
+       - 每条必须附带对应新闻的原文 URL
     
     请严格输出符合 NewsBriefing 结构的 JSON。
     **重要**：
     1. 直接输出 JSON 字符串，**不要**包含 ```json ... ``` 等 Markdown 格式。
-    2. JSON 根对象直接包含 `global_summary` 和 `clusters` 字段，**不要**包裹在 `NewsBriefing` 等根键下。
-    3. 不要包含任何推理过程文本。"""
+    2. JSON 根对象直接包含 `headlines` 和 `clusters` 字段，**不要**包裹在 `NewsBriefing` 等根键下。
+    3. 不要包含任何推理过程文本。
+    4. 所有总结性文字（headlines 的 title 和 clusters items 的 summary）的句末 **不要加句号**（。），保持简洁干练。"""
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
@@ -331,7 +377,7 @@ def detail_node(state: AgentState):
                     # 简单检查：直接看 briefing_data 字符串里有没有 cluster 名字？
                     # 或者解析后通过 Pydantic 检查
                     # 为求稳，我们先尝试解析
-                    # 注意：NewsBriefing 结构是 global_summary, clusters
+                    # 注意：NewsBriefing 结构是 headlines, clusters
                     # 这里是一个 dict
                     clusters_data = data_json.get("clusters", [])
                     for c in clusters_data:
@@ -364,12 +410,10 @@ def detail_node(state: AgentState):
     if not found_cluster:
         return {"messages": [AIMessage(content=f"⚠️ 未找到板块：{selected_cluster}")]}
         
-    # 渲染详情 (这里简化为 Markdown 文本，也可以做成卡片)
+    # 渲染详情：每条新闻的摘要本身就是超链接
     msg = f"## 📂 专题详情：{found_cluster.name}\n\n"
-    msg += f"_{found_cluster.description}_\n\n"
-    for item in found_cluster.items:
-        msg += f"### [{item.title}]({item.url})\n"
-        msg += f"{item.summary}\n\n"
+    for i, item in enumerate(found_cluster.items, 1):
+        msg += f"{i}. [{item.summary}]({item.url})\n"
     
     return {"messages": [AIMessage(content=msg)]}
 
