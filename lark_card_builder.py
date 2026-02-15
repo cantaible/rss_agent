@@ -46,7 +46,7 @@ def build_cover_card(briefing: NewsBriefing, generated_at: str = None, category:
                 "content": btn_text
             },
             "type": "default",
-            "value": {"command": "expand", "target": cluster.name} 
+            "value": {"command": "expand", "target": cluster.name, "category": category}
         }
         actions.append(action_btn)
     

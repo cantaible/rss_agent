@@ -176,7 +176,15 @@ async def lifespan(app: FastAPI):
 # 创建一个 App 实例，使用 lifespan
 app = FastAPI(lifespan=lifespan)
 
-def run_agent(user_id, text, message_id=None, force_refresh=False, user_preference=None):
+def run_agent(
+    user_id,
+    text,
+    message_id=None,
+    force_refresh=False,
+    user_preference=None,
+    selected_cluster=None,
+    selected_category=None,
+):
     """
     运行 LangGraph Agent
     
@@ -186,6 +194,8 @@ def run_agent(user_id, text, message_id=None, force_refresh=False, user_preferen
         message_id: 消息ID（用于回复）
         force_refresh: 是否强制刷新缓存
         user_preference: 直接指定用户偏好类别（定时任务专用，跳过 router 和数据库查询）
+        selected_cluster: 卡片点击时选中的专题名
+        selected_category: 卡片点击时选中的类别
     """
     config = {"configurable": {"thread_id": user_id}}
     
@@ -205,8 +215,18 @@ def run_agent(user_id, text, message_id=None, force_refresh=False, user_preferen
         "user_id": user_id,
         "message_id": message_id,
         "force_refresh": force_refresh, # [新增] 控制是否强制刷新
-        "user_preference": user_preference # [新增] 直接传入偏好类别
+        "user_preference": user_preference, # [新增] 直接传入偏好类别
+        "selected_cluster": selected_cluster,
+        "selected_category": selected_category,
     }
+    if force_refresh:
+        # 双保险：覆盖 checkpointer 中可能残留的结构化缓存状态
+        inputs.update({
+            "briefing_data": None,
+            "generated_at": None,
+            "selected_cluster": None,
+            "selected_category": None,
+        })
     
     # 传入 thread_id 以启用 state 持久化（每个用户独立存储）
     res = graph.invoke(inputs, config=config)
@@ -356,10 +376,10 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
                 )
                 #  print(f"📝 [Menu] 用户 {operator_id} 请求：归档日报到 Wiki")
                 from messaging import send_message
-                #  send_message(operator_id, "⏳ 正在将今日多类别日报归档至 Wiki，请稍候...")
-                send_message(operator_id, "此功能不需要手动触发，查看历史日报请点击：历史新闻->日报汇总")
+                send_message(operator_id, "⏳ 正在将今日多类别日报归档至 Wiki，请稍候...")
+                # send_message(operator_id, "此功能不需要手动触发，查看历史日报请点击：历史新闻->日报汇总")
 
-                #  background_tasks.add_task(archive_daily_news_to_wiki, operator_id)
+                background_tasks.add_task(archive_daily_news_to_wiki, operator_id)
 
             handled = True
 
@@ -371,18 +391,38 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
             action_value = event_data.get("action", {}).get("value", {})
             command = action_value.get("command")
             target = action_value.get("target")
+            selected_category = action_value.get("category")
 
             # 构造模拟的文本指令，例如 "展开：硬件与算力"
             if command == "expand" and target:
                 simulated_text = f"展开：{target}"
-                print(f"🃏 [Card Action] Received: {simulated_text}")
 
                 # 获取用户和消息上下文信息
-                sender_id = event_data.get("operator", {}).get("open_id")
+                sender_id = event_data.get("operator", {}).get("open_id") or operator_id
                 card_msg_id = event_data.get("context", {}).get("open_message_id")
+                print(
+                    f"🃏 [Card Action] Received expand target={target}, "
+                    f"category={selected_category}, operator_id={sender_id}, message_id={card_msg_id}"
+                )
+                _event_log(
+                    log_type="card_action",
+                    event_id=event_id,
+                    command=command,
+                    target=target,
+                    category=selected_category,
+                    operator_id=sender_id,
+                    message_id=card_msg_id,
+                )
 
                 # 后台处理（不返回 Toast，避免3秒超时限制）
-                background_tasks.add_task(handle_card_action_async, sender_id, simulated_text, card_msg_id, target)
+                background_tasks.add_task(
+                    handle_card_action_async,
+                    sender_id,
+                    simulated_text,
+                    card_msg_id,
+                    target,
+                    selected_category,
+                )
 
                 # 返回成功响应，不显示 Toast
                 # code:0 表示成功，toast.type: info 显示一个小提示
@@ -400,15 +440,24 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
             latency_ms=latency_ms,
         )
 
-async def handle_card_action_async(user_id, text, message_id, target):
+async def handle_card_action_async(user_id, text, message_id, target, selected_category=None):
     """处理卡片点击后的异步逻辑"""
-    print(f"🃏 [Async] Running agent for card action: {text}")
+    print(
+        f"🃏 [Async] Running agent for card action: {text}, "
+        f"target={target}, category={selected_category}, message_id={message_id}"
+    )
     
     # 立即发送"正在处理"消息，让用户知道系统已响应
     reply_message(message_id, f"⏳ 正在为您展开 **{target}** 的详细内容，请稍候...")
     
     # 后台慢慢处理（无3秒限制）
-    ai_reply_content, _ = run_agent(user_id, text, message_id)
+    ai_reply_content, _ = run_agent(
+        user_id,
+        text,
+        message_id,
+        selected_cluster=target,
+        selected_category=selected_category,
+    )
     reply_message(message_id, ai_reply_content)
 
 async def archive_daily_news_to_wiki(user_id=None, notify_user=True):

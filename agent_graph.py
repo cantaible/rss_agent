@@ -61,9 +61,11 @@ class AgentState(TypedDict):
     
     # [新增] 结构化简报数据 (用于多轮回忆)
     briefing_data: Optional[Dict] # 实际存的是 NewsBriefing.model_dump()
+    generated_at: Optional[str]
     
     # [新增] 当前选中的详情板块 (与 user_preference 长期偏好区分开)
     selected_cluster: Optional[str]
+    selected_category: Optional[str]
 
     # 控制流标志
     intent: Optional[str] # write / read / chat
@@ -110,7 +112,11 @@ def router_node(state: AgentState):
         if match:
             category = match.group(1).strip()
             print(f"🚀 [Router] Intercepted Detail Request: {category}")
-            return {"intent": "detail", "selected_cluster": category}
+            return {
+                "intent": "detail",
+                "selected_cluster": category,
+                "selected_category": state.get("selected_category"),
+            }
     
     try:
         # 定义 System Prompt 强化指令 (适配 Reasoning 模型)
@@ -235,7 +241,14 @@ def fetcher_node(state: AgentState):
     news_data = fetch_news(pref)
     
     print(f"✅ [Fetcher] Got data (length: {len(str(news_data))})")
-    return {"user_preference": pref, "news_content": json.dumps(news_data, ensure_ascii=False)}
+    # 关键：当需要重新抓取时，显式清空旧结构化结果，避免 writer 命中 checkpointer 残留 state
+    return {
+        "user_preference": pref,
+        "news_content": json.dumps(news_data, ensure_ascii=False),
+        "briefing_data": None,
+        "generated_at": None,
+        "selected_cluster": None,
+    }
 
 from messaging import reply_message
 
@@ -257,8 +270,8 @@ def writer_node(state: AgentState):
     news_json = state.get("news_content")
     category = state.get("user_preference", "未知领域")
     
-    # 策略 0: 如果 State 中已有 briefing_data (来自 Cache)，直接使用
-    if state.get("briefing_data"):
+    # 策略 0: 仅在非强制刷新时允许复用 State 中的 briefing_data (来自 Cache)
+    if (not state.get("force_refresh")) and state.get("briefing_data"):
         try:
             print(f"⏩ [Writer] Using cached briefing data for {category}")
             # Pydantic 还原
@@ -348,8 +361,7 @@ def writer_node(state: AgentState):
 # --- 详情展示节点 ---
 
 from database import get_cached_news # Import at top or inside if circular
-from datetime import date, timedelta # [新增] timedelta
-from database import get_cached_news
+from datetime import date
 
 # --- 详情展示节点 ---
 def detail_node(state: AgentState):
@@ -357,58 +369,61 @@ def detail_node(state: AgentState):
     接收用户选择的板块名 -> 从 State 缓存或数据库中查找新闻 -> 渲染详情
     """
     print("🔍 [Detail] Node started")
-    selected_cluster = state.get("selected_cluster") # 使用专门的字段
-    briefing_dump = state.get("briefing_data")
-    
-    # 策略 1: 尝试从 State 获取 (如果是同一会话)
-    # 策略 2: 尝试从数据库获取 (如果是跨会话点击)
-    if not briefing_dump:
-        print(f"⚠️ [Detail] State missing briefing_data, searching DB for cluster: {selected_cluster}")
-        today = date.today().isoformat()
-        categories = ["AI", "GAMES", "MUSIC", "SHORT_DRAMA"] # 已知类别
-        
-        for cat in categories:
-            cached = get_cached_news(cat, today)
-            # get_cached_news 返回 {"content": str, "briefing_data": str}
-            if cached and cached.get("briefing_data"):
-                try:
-                    data_json = json.loads(cached["briefing_data"])
-                    # 检查 cluster 是否在这里
-                    # 简单检查：直接看 briefing_data 字符串里有没有 cluster 名字？
-                    # 或者解析后通过 Pydantic 检查
-                    # 为求稳，我们先尝试解析
-                    # 注意：NewsBriefing 结构是 headlines, clusters
-                    # 这里是一个 dict
-                    clusters_data = data_json.get("clusters", [])
-                    for c in clusters_data:
-                        if c.get("name") and (selected_cluster in c["name"] or c["name"] in selected_cluster):
-                            print(f"✅ [Detail] Found cluster in DB category: {cat}")
-                            briefing_dump = data_json
-                            break
-                except Exception as e:
-                    print(f"⚠️ [Detail] Parse DB cache failed for {cat}: {e}")
-            
-            if briefing_dump:
-                break
-    
-    if not briefing_dump or not selected_cluster:
-        return {"messages": [AIMessage(content=f"⚠️ 未找到板块：{selected_cluster}。\n\n数据可能已更新过期，请发送“生成日报”获取最新资讯。")]}
-    
-    # 恢复 Pydantic 对象
+    target_cluster = state.get("selected_cluster")
+    selected_category = state.get("selected_category")
+    print(
+        f"🔎 [Detail] target_cluster={target_cluster}, "
+        f"selected_category={selected_category}, resolved_category=None"
+    )
+
+    if not target_cluster:
+        return {"messages": [AIMessage(content="⚠️ 未指定要展开的专题，请重新点击卡片按钮")]}
+
+    if not selected_category:
+        return {
+            "messages": [
+                AIMessage(
+                    content="当前卡片版本较旧，缺少类别信息。请先重新生成日报卡片后再展开专题。"
+                )
+            ]
+        }
+
+    today = date.today().isoformat()
+    cached = get_cached_news(selected_category, today)
+    if not cached or not cached.get("briefing_data"):
+        return {
+            "messages": [
+                AIMessage(
+                    content=f"⚠️ 未找到 {selected_category} 今日缓存。\n\n请先重新生成该类别日报后再展开专题。"
+                )
+            ]
+        }
+
     try:
+        briefing_dump = json.loads(cached["briefing_data"])
         briefing = NewsBriefing(**briefing_dump)
-    except:
+    except Exception as e:
+        print(f"⚠️ [Detail] Parse cache failed for category={selected_category}: {e}")
         return {"messages": [AIMessage(content="⚠️ 数据解析错误")]}
-    
-    # 查找对应板块
+
+    # 仅做精确匹配，避免同名专题串到其他类别
     found_cluster = None
     for cluster in briefing.clusters:
-        if cluster.name in selected_cluster or selected_cluster in cluster.name:
+        if cluster.name == target_cluster:
             found_cluster = cluster
             break
-            
+
     if not found_cluster:
-        return {"messages": [AIMessage(content=f"⚠️ 未找到板块：{selected_cluster}")]}
+        return {
+            "messages": [
+                AIMessage(content=f"⚠️ 在 {selected_category} 类别下未找到专题：{target_cluster}")
+            ]
+        }
+
+    print(
+        f"✅ [Detail] target_cluster={target_cluster}, "
+        f"selected_category={selected_category}, resolved_category={selected_category}"
+    )
         
     # 渲染详情：每条新闻的摘要本身就是超链接
     msg = f"## 📂 专题详情：{found_cluster.name}\n\n"
