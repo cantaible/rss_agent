@@ -8,15 +8,23 @@ import time
 
 from agent_graph import graph
 from langchain_core.messages import HumanMessage
-from messaging import reply_message
+from messaging import reply_message, update_message
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import date, datetime, timezone as dt_timezone
-from database import save_cached_news, get_cached_news, DB_FILE, upsert_preference, init_db
-import sqlite3
+from database import (
+    save_cached_news,
+    get_cached_news,
+    init_db,
+    add_subscription,
+    get_subscriptions,
+    list_all_subscriptions,
+    replace_subscriptions,
+)
 import asyncio
 import threading
 from pytz import timezone
 from collections import deque
+from lark_card_builder import build_manage_subscribe_card
 
 # 事件去重队列
 processed_events = deque(maxlen=100)
@@ -25,6 +33,11 @@ processed_events = deque(maxlen=100)
 beijing_tz = timezone('Asia/Shanghai')
 scheduler = BackgroundScheduler(timezone=beijing_tz)
 daily_archive_push_lock = threading.Lock()
+manage_subscribe_state_lock = threading.Lock()
+pending_manage_subscriptions = {}
+manage_subscribe_action_dedup_lock = threading.Lock()
+recent_manage_subscribe_actions = {}
+MANAGE_SUBSCRIBE_ACTION_DEDUP_WINDOW_SEC = 3.0
 
 
 def _event_log(**fields):
@@ -41,6 +54,72 @@ def _extract_operator_id(body):
         or event.get("operator", {}).get("open_id")
         or event.get("sender", {}).get("sender_id", {}).get("open_id")
     )
+
+
+def _normalize_selected_categories(action_obj, allowed_categories):
+    """从卡片 action 中提取并规范化多选类别。"""
+    candidates = []
+    # 兼容 form 提交
+    form_value = action_obj.get("form_value", {}) if isinstance(action_obj, dict) else {}
+    if "categories" in form_value:
+        candidates = form_value["categories"]
+        if isinstance(candidates, str):
+            candidates = [candidates]
+        elif not isinstance(candidates, list):
+            candidates = []
+        return [cat for cat in candidates if cat in allowed_categories]
+
+    raw_values = (
+        form_value.get("selected_categories")
+        or form_value.get("categories")
+        or action_obj.get("selected_categories")
+        or action_obj.get("categories")
+        or action_obj.get("value", {}).get("selected_categories")
+        or action_obj.get("value", {}).get("categories")
+    )
+
+    if isinstance(raw_values, str):
+        candidates = [item.strip() for item in raw_values.split(",") if item and item.strip()]
+    elif isinstance(raw_values, list):
+        for item in raw_values:
+            if isinstance(item, str):
+                candidates.append(item.strip())
+            elif isinstance(item, dict):
+                value = item.get("value") or item.get("key")
+                if isinstance(value, str):
+                    candidates.append(value.strip())
+    elif isinstance(raw_values, dict):
+        # 兼容 {"AI": true, "MUSIC": false} 这种结构
+        for key, selected in raw_values.items():
+            if selected:
+                candidates.append(str(key).strip())
+
+    unique = []
+    seen = set()
+    for category in candidates:
+        if category in allowed_categories and category not in seen:
+            seen.add(category)
+            unique.append(category)
+    return unique
+
+
+def _is_duplicate_manage_subscribe_action(action_key: str) -> bool:
+    """短窗口去重：防止同一次点击被双回调重复处理。"""
+    now = time.monotonic()
+    with manage_subscribe_action_dedup_lock:
+        expired = [
+            key for key, ts in recent_manage_subscribe_actions.items()
+            if now - ts > MANAGE_SUBSCRIBE_ACTION_DEDUP_WINDOW_SEC
+        ]
+        for key in expired:
+            recent_manage_subscribe_actions.pop(key, None)
+
+        last_ts = recent_manage_subscribe_actions.get(action_key)
+        if last_ts is not None and (now - last_ts) <= MANAGE_SUBSCRIBE_ACTION_DEDUP_WINDOW_SEC:
+            return True
+
+        recent_manage_subscribe_actions[action_key] = now
+        return False
 
 # def pre_generate_daily_news():
 #     """(已弃用) 每天9点：预生成4个类别的早报"""
@@ -97,23 +176,21 @@ def generate_news_task(force=True):
 def push_delivery_task():
     """🛵 外卖员任务：推送最新的新闻"""
     today = date.today().isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    users = conn.execute("SELECT user_id, category FROM user_preferences").fetchall()
-    conn.close()
+    subscriptions = list_all_subscriptions()
     
     from messaging import send_message
     
-    print(f"🛵 [Delivery] Starting daily push dispatch...")
+    print(f"🛵 [Delivery] Starting daily push dispatch... ({len(subscriptions)} subscriptions)")
     
-    for user_id, category in users:
+    for user_id, category in subscriptions:
         # 1. 只是去取货
         cached_data = get_cached_news(category, today)
         
         if cached_data and cached_data.get("content"):
-            print(f"📤 [Delivery] Pushing hot news to {user_id}")
+            print(f"📤 [Delivery] Pushing {category} news to {user_id}")
             send_message(user_id, cached_data["content"])
         else:
-            print(f"⚠️ [Delivery] No food ready for {user_id} (Cache miss)")
+            print(f"⚠️ [Delivery] No food ready for {user_id}/{category} (Cache miss)")
             # 可选：这里可以触发一次 generate_news_task() 作为补救
 
 def daily_archive_and_push_job():
@@ -268,18 +345,38 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
     try:
         # 解析原始 JSON
         body = await request.json()
+        raw_action_payload = None
         event = body.get("event", {})
         event_type = body.get("header", {}).get("event_type")
+        if not event and body.get("action") and body.get("open_id"):
+            # 兼容卡片回调的另一种 payload 格式（无 header/event 包裹）
+            raw_action_payload = body
+            event = {
+                "action": raw_action_payload.get("action", {}),
+                "operator": {"open_id": raw_action_payload.get("open_id")},
+                "context": {"open_message_id": raw_action_payload.get("open_message_id")},
+            }
+            event_type = "card.action.trigger"
+
         request_type = body.get("type")
         event_id = body.get("header", {}).get("event_id")
+        raw_action_trace_id = None
+        if not event_id and raw_action_payload:
+            # 顶层 action payload 常无唯一 event_id；不要用 token 伪造 event_id，
+            # 否则会被去重逻辑误伤（token 可能是固定值）。
+            raw_action_trace_id = (
+                f"raw_card:{raw_action_payload.get('open_message_id')}:"
+                f"{raw_action_payload.get('action', {}).get('value', {}).get('command')}"
+            )
         event_key = event.get("event_key")
-        operator_id = _extract_operator_id(body)
+        operator_id = _extract_operator_id(body) or (raw_action_payload.get("open_id") if raw_action_payload else None)
         create_time = event.get("create_time")
         client_ip = request.client.host if request.client else None
 
         _event_log(
             log_type="event_in",
             event_id=event_id,
+            raw_action_trace_id=raw_action_trace_id,
             event_type=event_type,
             request_type=request_type,
             event_key=event_key,
@@ -292,9 +389,11 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
         print(f"\n{'='*60}")
         print(f"📨 [DEBUG] Received request")
         print(f"Request type: {body.get('type')}")
-        print(f"Event type: {body.get('header', {}).get('event_type')}")
+        print(f"Event type: {event_type}")
         print(f"Full body keys: {list(body.keys())}")
-        print(f"Full body keys: {list(body.keys())}")
+        if raw_action_payload:
+            print(f"Raw card action tag: {raw_action_payload.get('action', {}).get('tag')}")
+            print(f"Raw card action value: {json.dumps(raw_action_payload.get('action', {}).get('value', {}), ensure_ascii=False)}")
         print(f"{'='*60}\n")
 
         # 0. 去重处理 (防止飞书超时重试导致二次触发)
@@ -335,14 +434,34 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
                     event_key=event_key,
                     branch="subscribe",
                 )
-                category = event_key.split(":")[1]
-                upsert_preference(operator_id, category)
+                category = event_key.split(":", 1)[1]
+                add_subscription(operator_id, category)
+                subscriptions = get_subscriptions(operator_id)
+                subscribed_text = "、".join(subscriptions) if subscriptions else category
 
                 # 由于菜单点击没有 message_id 上下文，我们需要主动发消息给用户
                 # 但这里没有 reply token，通常直接调 send_message
                 from messaging import send_message
 
-                send_message(operator_id, f"✅ 已成功订阅 **{category}** 类别！\n我们将为您推送该类别的每日早报。")
+                send_message(
+                    operator_id,
+                    f"✅ 已成功订阅 **{category}** 类别！\n当前已关注：{subscribed_text}\n我们将为您推送以上类别的每日日报。"
+                )
+
+            elif event_key == "MANAGE_SUBSCRIBE":
+                _event_log(
+                    log_type="menu_branch",
+                    event_id=event_id,
+                    event_key=event_key,
+                    branch="manage_subscribe",
+                )
+                subscriptions = get_subscriptions(operator_id)
+                with manage_subscribe_state_lock:
+                    pending_manage_subscriptions[operator_id] = list(subscriptions)
+                manage_card = build_manage_subscribe_card(subscriptions, DAILY_NEWS_CATEGORIES)
+
+                from messaging import send_message
+                send_message(operator_id, manage_card)
 
             # 2. 新增：处理手动触发新闻请求
             elif event_key in ["REQUEST_MUSIC_NEWS", "REQUEST_GAMES_NEWS", "REQUEST_AI_NEWS"]:
@@ -387,19 +506,65 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
         # 当用户点击卡片按钮时触发
         elif event_type == "card.action.trigger":
             # 从 event 对象中获取数据
-            event_data = body.get("event", {})
-            action_value = event_data.get("action", {}).get("value", {})
+            event_data = event
+            action_obj = event_data.get("action", {})
+            action_value = action_obj.get("value", {})
             command = action_value.get("command")
             target = action_value.get("target")
             selected_category = action_value.get("category")
+            sender_id = event_data.get("operator", {}).get("open_id") or operator_id
+            card_msg_id = event_data.get("context", {}).get("open_message_id")
+
+            if command == "manage_subscribe_toggle":
+                dedup_key = "|".join([
+                    sender_id or "",
+                    card_msg_id or "",
+                    command or "",
+                    selected_category or "",
+                ])
+                if _is_duplicate_manage_subscribe_action(dedup_key):
+                    _event_log(
+                        log_type="event_dedup",
+                        dedup="hit_manage_subscribe_action",
+                        event_id=event_id or raw_action_trace_id,
+                        dedup_key=dedup_key,
+                    )
+                    handled = True
+                    return {"code": 0}
+            if command == "manage_subscribe_toggle":
+                if not selected_category or selected_category not in DAILY_NEWS_CATEGORIES:
+                    handled = True
+                    return {"code": 0}
+
+                # 直接读库 -> 切换 -> 写库 -> 刷新卡片
+                current = list(get_subscriptions(sender_id))
+                if selected_category in current:
+                    current.remove(selected_category)
+                    toast_msg = f"已取消订阅 {selected_category}"
+                else:
+                    current.append(selected_category)
+                    toast_msg = f"已订阅 {selected_category}"
+
+                # 保持与 DAILY_NEWS_CATEGORIES 相同的顺序
+                ordered = [cat for cat in DAILY_NEWS_CATEGORIES if cat in current]
+                replace_subscriptions(sender_id, ordered)
+                print(f"💾 [Toggle Save] user={sender_id}, cat={selected_category}, new={ordered}")
+
+                subscribed_text = "、".join(ordered) or "无"
+                status_msg = f"✅ 订阅已更新：{subscribed_text}"
+                refreshed_card = build_manage_subscribe_card(ordered, DAILY_NEWS_CATEGORIES)
+                from messaging import send_message
+                send_message(sender_id, status_msg)   # 独立文字消息
+                send_message(sender_id, refreshed_card)  # 新卡片
+
+                handled = True
+                return {"code": 0}
 
             # 构造模拟的文本指令，例如 "展开：硬件与算力"
             if command == "expand" and target:
                 simulated_text = f"展开：{target}"
 
                 # 获取用户和消息上下文信息
-                sender_id = event_data.get("operator", {}).get("open_id") or operator_id
-                card_msg_id = event_data.get("context", {}).get("open_message_id")
                 print(
                     f"🃏 [Card Action] Received expand target={target}, "
                     f"category={selected_category}, operator_id={sender_id}, message_id={card_msg_id}"

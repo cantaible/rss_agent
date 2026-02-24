@@ -289,39 +289,12 @@ MIT
 **Docker 服务：**
 
 ```bash
-# 查看运行状态
-docker-compose ps
-
-# 重启服务
-docker-compose restart
-
-# 查看所有日志（lark_service + cpolar）
-docker-compose logs -f
-
-# 只查看最近 100 行日志
-docker-compose logs --tail=100
-
-# 只查看 lark_service 日志（过滤掉 cpolar）
-docker-compose logs -f | grep -v "cpolar"
-
-# 按类型过滤日志
-docker-compose logs -f | grep "📧\|🚦\|📤"  # 消息处理
-docker-compose logs -f | grep "❌\|ERROR"   # 错误日志
-docker-compose logs -f | grep "👨‍🍳\|🛵"      # 调度任务
-
-# 进入容器内部查看日志
-docker-compose exec rss-agent bash
-supervisorctl status                          # 查看进程状态
-supervisorctl tail -f lark_service           # 实时查看 lark_service 日志
-supervisorctl tail -f cpolar                 # 实时查看 cpolar 日志
-
-# 进入容器调试
-docker-compose exec rss-agent bash
 
 # 更新代码后重新部署
 git pull
-docker-compose down
-docker-compose up -d --build
+docker compose down
+docker compose up -d --build
+docker compose exec rss-agent python manual_trigger.py
 ```
 
 **Cpolar 管理：**

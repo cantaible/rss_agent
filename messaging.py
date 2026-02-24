@@ -115,3 +115,45 @@ def send_message(receive_id, content):
             
     except Exception as e:
         print(f"❌ Exception in send_message: {str(e)}")
+
+
+def update_message(message_id, content):
+    """原位更新消息内容（主要用于更新卡片状态）。"""
+    try:
+        token = get_tenant_access_token()
+        if not token:
+            return False
+
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+
+        msg_type = "text"
+        final_content = content
+        if isinstance(content, str) and content.strip().startswith("{") and '"header"' in content:
+            msg_type = "interactive"
+        else:
+            final_content = json.dumps({"text": str(content)}, ensure_ascii=False)
+
+        payload = {
+            "content": final_content,
+            "msg_type": msg_type,
+        }
+
+        resp = requests.patch(url, headers=headers, json=payload)
+        if resp.status_code != 200:
+            print(f"❌ Update Message HTTP Error: {resp.text}")
+            return False
+
+        body = resp.json()
+        if body.get("code") != 0:
+            print(f"❌ Update Message Logic Error: {body}")
+            return False
+
+        print(f"📝 Updated message: {message_id}")
+        return True
+    except Exception as e:
+        print(f"❌ Exception in update_message: {str(e)}")
+        return False
