@@ -38,6 +38,9 @@ pending_manage_subscriptions = {}
 manage_subscribe_action_dedup_lock = threading.Lock()
 recent_manage_subscribe_actions = {}
 MANAGE_SUBSCRIBE_ACTION_DEDUP_WINDOW_SEC = 3.0
+expand_action_dedup_lock = threading.Lock()
+recent_expand_actions = {}
+EXPAND_ACTION_DEDUP_WINDOW_SEC = 8.0
 
 
 def _event_log(**fields):
@@ -119,6 +122,25 @@ def _is_duplicate_manage_subscribe_action(action_key: str) -> bool:
             return True
 
         recent_manage_subscribe_actions[action_key] = now
+        return False
+
+
+def _is_duplicate_expand_action(action_key: str) -> bool:
+    """短窗口去重：防止同一次 expand 点击被双回调重复处理。"""
+    now = time.monotonic()
+    with expand_action_dedup_lock:
+        expired = [
+            key for key, ts in recent_expand_actions.items()
+            if now - ts > EXPAND_ACTION_DEDUP_WINDOW_SEC
+        ]
+        for key in expired:
+            recent_expand_actions.pop(key, None)
+
+        last_ts = recent_expand_actions.get(action_key)
+        if last_ts is not None and (now - last_ts) <= EXPAND_ACTION_DEDUP_WINDOW_SEC:
+            return True
+
+        recent_expand_actions[action_key] = now
         return False
 
 # def pre_generate_daily_news():
@@ -562,6 +584,23 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
 
             # 构造模拟的文本指令，例如 "展开：硬件与算力"
             if command == "expand" and target:
+                expand_dedup_key = "|".join([
+                    sender_id or "",
+                    card_msg_id or "",
+                    command or "",
+                    target or "",
+                    selected_category or "",
+                ])
+                if _is_duplicate_expand_action(expand_dedup_key):
+                    _event_log(
+                        log_type="event_dedup",
+                        dedup="hit_expand_action",
+                        event_id=event_id or raw_action_trace_id,
+                        dedup_key=expand_dedup_key,
+                    )
+                    handled = True
+                    return {"code": 0}
+
                 simulated_text = f"展开：{target}"
 
                 # 获取用户和消息上下文信息
