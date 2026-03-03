@@ -243,8 +243,11 @@ async def lifespan(app: FastAPI):
     print("⏰ Starting Scheduler...")
     from datetime import datetime, timedelta
     
-    # 1. 厨师任务：北京时间 8:00 - 22:00，每2小时做一次饭
-    scheduler.add_job(generate_news_task, 'cron', hour='8-22/2', minute=0, timezone=beijing_tz)
+    # # 1. 厨师任务：北京时间 8:00 - 22:00，每2小时做一次饭
+    # scheduler.add_job(generate_news_task, 'cron', hour='8-22/2', minute=0, timezone=beijing_tz)
+    # 1. 厨师任务：北京时间每天 8:00 执行一次
+    scheduler.add_job(generate_news_task, 'cron', hour=8, minute=0, timezone=beijing_tz)
+
     
     # 2. 也是厨师任务：刚开业（启动服务）时先做一顿
     # 关键：这里 force=False，如果数据库里已经有菜了，就不重做了 (避免热重载时疯狂生成)
@@ -509,18 +512,18 @@ async def handle_event(request: Request, background_tasks: BackgroundTasks):
 
             # 3. 新增：测试归档到 Wiki
             elif event_key == "WRITE_DAILY_NEWS":
-                _event_log(
-                    log_type="menu_branch",
-                    event_id=event_id,
-                    event_key=event_key,
-                    branch="WRITE_DAILY_NEWS",
-                )
-                #  print(f"📝 [Menu] 用户 {operator_id} 请求：归档日报到 Wiki")
-                from messaging import send_message
-                send_message(operator_id, "⏳ 正在将今日多类别日报归档至 Wiki，请稍候...")
-                # send_message(operator_id, "此功能不需要手动触发，查看历史日报请点击：历史新闻->日报汇总")
+                # _event_log(
+                #     log_type="menu_branch",
+                #     event_id=event_id,
+                #     event_key=event_key,
+                #     branch="WRITE_DAILY_NEWS",
+                # )
+                # #  print(f"📝 [Menu] 用户 {operator_id} 请求：归档日报到 Wiki")
+                # from messaging import send_message
+                # send_message(operator_id, "⏳ 正在将今日多类别日报归档至 Wiki，请稍候...")
+                send_message(operator_id, "此功能不需要手动触发，查看历史日报请点击：历史新闻->日报汇总")
 
-                background_tasks.add_task(archive_daily_news_to_wiki, operator_id)
+                # background_tasks.add_task(archive_daily_news_to_wiki, operator_id)
 
             handled = True
 

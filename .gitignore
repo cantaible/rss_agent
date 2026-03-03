@@ -10,3 +10,5 @@ rss_agent.db
 cpolar.log
 /bot写入文档
 *.log
+/docs
+
