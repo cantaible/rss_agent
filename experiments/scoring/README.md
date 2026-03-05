@@ -15,16 +15,17 @@
 通用分（`CommonScore`）由四项组成：
 - `impact`：事件对行业/产品/市场格局的实际影响（LLM 0~5）。
 - `controversy`：争议、监管、伦理、舆情冲突强度（LLM 0~5）。
-- `prominence`：主体头部性（规则 0~5），按 `validated_tiers` 计算：
-  - 命中任一 `tier1` -> `5.0`
-  - 否则命中任一 `tier2` -> `4.0`
+- `prominence`：主体头部性（规则 0~5），越是关心的公司（有个关注列表），得分越高：
+  - 命中任一 `tier1`的公司 -> `5.0`
+  - 否则命中任一 `tier2`的公司 -> `4.0`
   - 未命中 tier（但有主体）-> `2.2`
   - 未抽到主体 -> `1.5`
-- `heat`：热度（规则 0~5），仅由事件簇大小 `event_size` 决定：  
-  `heat = clip(0.8 + 1.5 * ln(event_size), 0, 5)`，并保留 2 位小数。
+- `heat`：热度（规则 0~5），被重复报道多次的新闻，热度被认为越高。
+  - 仅由每个新闻的重复报道数 `event_size` 决定：  
+  - `heat = clip(0.8 + 1.5 * ln(event_size), 0, 5)`，并保留 2 位小数。
 
 惩罚分（`PenaltyScore`）：
-- `source_volume_penalty`：来源灌水惩罚（规则分）：
+- `source_volume_penalty`：来源灌水惩罚，同一个新闻源每天报道的新闻越多，这个惩罚就越大：
   - 若 `source_daily_count <= 3`，惩罚为 `0`
   - 否则 `penalty = clip(0.8 * ln(source_daily_count), 0, 2.5)`，并保留 2 位小数
 
