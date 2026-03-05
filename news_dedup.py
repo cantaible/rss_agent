@@ -42,7 +42,17 @@ def dedupe_news_payload(
     - exact_only 只做规则去重（URL/标题）。
     - semantic 在 exact 基础上再做向量相似度聚类（complete linkage）。
     """
-    t0 = time.time()
+    t0 = time.perf_counter()
+    timing_ms: Dict[str, float] = {
+        "validate_ms": 0.0,
+        "exact_ms": 0.0,
+        "semantic_prepare_ms": 0.0,
+        "embedding_ms": 0.0,
+        "similarity_ms": 0.0,
+        "clustering_ms": 0.0,
+        "postprocess_ms": 0.0,
+        "total_ms": 0.0,
+    }
     # meta: 面向实验与观测的统计信息
     meta: Dict[str, Any] = {
         "mode": mode,
@@ -53,6 +63,7 @@ def dedupe_news_payload(
         "dropped_count": 0,
         "dedup_rate": 0.0,
         "duration_ms": 0,
+        "timing_ms": timing_ms,
         "warnings": [],
         "fail_open": False,
     }
@@ -62,9 +73,11 @@ def dedupe_news_payload(
         "dropped": [],
         "clusters": [],
     }
+    validate_t0 = time.perf_counter()
 
     # 模式关闭：直接透传输入
     if not enabled or mode == "off":
+        timing_ms["validate_ms"] = _elapsed_ms(validate_t0)
         input_count = _safe_count(payload)
         meta.update(
             {
@@ -73,27 +86,30 @@ def dedupe_news_payload(
                 "output_count": input_count,
                 "dropped_count": 0,
                 "dedup_rate": 0.0,
-                "duration_ms": int((time.time() - t0) * 1000),
             }
         )
+        _set_total_timing(meta, t0)
         return payload, meta, trace
 
     # 输入不是 dict，直接降级
     if not isinstance(payload, dict):
+        timing_ms["validate_ms"] = _elapsed_ms(validate_t0)
         meta["warnings"].append("payload_not_dict")
         meta["fail_open"] = True
-        meta["duration_ms"] = int((time.time() - t0) * 1000)
+        _set_total_timing(meta, t0)
         return payload, meta, trace
 
     # 顶层结构不符合约定：status!=200 或 data 非数组
     if payload.get("status") != 200 or not isinstance(payload.get("data"), list):
+        timing_ms["validate_ms"] = _elapsed_ms(validate_t0)
         meta["warnings"].append("invalid_payload_shape")
         meta["fail_open"] = True
-        meta["duration_ms"] = int((time.time() - t0) * 1000)
+        _set_total_timing(meta, t0)
         return payload, meta, trace
 
     records: List[Dict[str, Any]] = payload["data"]
     meta["input_count"] = len(records)
+    timing_ms["validate_ms"] = _elapsed_ms(validate_t0)
 
     # 0/1 条无需去重，直接返回
     if len(records) <= 1:
@@ -103,14 +119,16 @@ def dedupe_news_payload(
                 "output_count": len(records),
                 "dropped_count": 0,
                 "dedup_rate": 0.0,
-                "duration_ms": int((time.time() - t0) * 1000),
             }
         )
         trace["kept_ids"] = [_article_id(item, i) for i, item in enumerate(records)]
+        _set_total_timing(meta, t0)
         return payload, meta, trace
 
     # Step 1: 规则去重（URL / 标题）
+    exact_t0 = time.perf_counter()
     exact_keep, exact_dropped = _exact_dedup(records)
+    timing_ms["exact_ms"] = _elapsed_ms(exact_t0)
     meta["after_exact_count"] = len(exact_keep)
     trace["dropped"].extend(exact_dropped)
 
@@ -131,6 +149,7 @@ def dedupe_news_payload(
         return deduped_payload, meta, trace
 
     # Step 2: 语义去重
+    prepare_t0 = time.perf_counter()
     semantic_items: List[Dict[str, Any]] = []
     semantic_texts: List[str] = []
     # 记录“语义样本索引 -> exact_keep 索引”的映射
@@ -143,6 +162,7 @@ def dedupe_news_payload(
             semantic_items.append(item)
             semantic_texts.append(text)
             semantic_idx_to_exact_idx.append(exact_idx)
+    timing_ms["semantic_prepare_ms"] = _elapsed_ms(prepare_t0)
 
     # 没有足够语义样本可比，直接返回规则去重结果
     if len(semantic_texts) <= 1:
@@ -162,19 +182,26 @@ def dedupe_news_payload(
 
     try:
         # 2.1 批量向量化
+        embedding_t0 = time.perf_counter()
         embeddings = _get_embeddings(semantic_texts, embedding_model)
+        timing_ms["embedding_ms"] = _elapsed_ms(embedding_t0)
         # 2.2 精确余弦相似度矩阵
+        sim_t0 = time.perf_counter()
         sim_matrix = _pairwise_cosine_similarity(embeddings)
+        timing_ms["similarity_ms"] = _elapsed_ms(sim_t0)
         # 2.3 完全链接聚类（簇内最小相似度约束）
+        clustering_t0 = time.perf_counter()
         semantic_clusters = _complete_linkage_clusters(sim_matrix, threshold)
+        timing_ms["clustering_ms"] = _elapsed_ms(clustering_t0)
     except Exception as e:
         # 语义阶段失败 -> fail-open（返回原始输入）
         meta["warnings"].append(f"semantic_stage_failed:{str(e)}")
         meta["fail_open"] = True
-        meta["duration_ms"] = int((time.time() - t0) * 1000)
+        _set_total_timing(meta, t0)
         return payload, meta, trace
 
     # 将语义簇映射回 exact_keep 索引空间
+    postprocess_t0 = time.perf_counter()
     exact_clusters: List[List[int]] = []
     for cluster in semantic_clusters:
         exact_cluster = [semantic_idx_to_exact_idx[i] for i in cluster]
@@ -238,6 +265,7 @@ def dedupe_news_payload(
 
     deduped_payload = dict(payload)
     deduped_payload["data"] = deduped_data
+    timing_ms["postprocess_ms"] = _elapsed_ms(postprocess_t0)
 
     trace["kept_ids"] = [_article_id(item, i) for i, item in enumerate(deduped_data)]
     _finalize_meta(meta, len(deduped_data), t0)
@@ -520,4 +548,18 @@ def _finalize_meta(meta: Dict[str, Any], output_count: int, t0: float) -> None:
     meta["output_count"] = output_count
     meta["dropped_count"] = dropped_count
     meta["dedup_rate"] = round(dedup_rate, 4)
-    meta["duration_ms"] = int((time.time() - t0) * 1000)
+    _set_total_timing(meta, t0)
+
+
+def _elapsed_ms(start_t: float) -> float:
+    """返回从 start_t 到当前的耗时（毫秒，保留 3 位小数）。"""
+    return round((time.perf_counter() - start_t) * 1000, 3)
+
+
+def _set_total_timing(meta: Dict[str, Any], t0: float) -> None:
+    """统一写入总耗时（兼容旧字段 duration_ms + 新字段 timing_ms.total_ms）。"""
+    total_ms = round((time.perf_counter() - t0) * 1000, 3)
+    timing = meta.get("timing_ms")
+    if isinstance(timing, dict):
+        timing["total_ms"] = total_ms
+    meta["duration_ms"] = int(total_ms)

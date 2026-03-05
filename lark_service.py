@@ -325,6 +325,10 @@ def run_agent(
         # 双保险：覆盖 checkpointer 中可能残留的结构化缓存状态
         inputs.update({
             "briefing_data": None,
+            # 评分模块相关缓存也一并清空，避免跨轮残留污染本次结果
+            "scored_events": None,
+            "scoring_meta": None,
+            "dedup_trace": None,
             "generated_at": None,
             "selected_cluster": None,
             "selected_category": None,

@@ -89,6 +89,25 @@ def run() -> None:
                         "dropped_count": meta.get("dropped_count", 0),
                         "dedup_rate": meta.get("dedup_rate", 0),
                         "duration_ms": meta.get("duration_ms", 0),
+                        "timing_ms": meta.get("timing_ms", {}),
+                        "timing_validate_ms": (meta.get("timing_ms") or {}).get("validate_ms", 0),
+                        "timing_exact_ms": (meta.get("timing_ms") or {}).get("exact_ms", 0),
+                        "timing_semantic_prepare_ms": (meta.get("timing_ms") or {}).get(
+                            "semantic_prepare_ms", 0
+                        ),
+                        "timing_embedding_ms": (meta.get("timing_ms") or {}).get(
+                            "embedding_ms", 0
+                        ),
+                        "timing_similarity_ms": (meta.get("timing_ms") or {}).get(
+                            "similarity_ms", 0
+                        ),
+                        "timing_clustering_ms": (meta.get("timing_ms") or {}).get(
+                            "clustering_ms", 0
+                        ),
+                        "timing_postprocess_ms": (meta.get("timing_ms") or {}).get(
+                            "postprocess_ms", 0
+                        ),
+                        "timing_total_ms": (meta.get("timing_ms") or {}).get("total_ms", 0),
                         "fail_open": meta.get("fail_open", False),
                         "warnings": meta.get("warnings", []),
                     }
@@ -99,11 +118,13 @@ def run() -> None:
     print(f"\n✅ Done. Results saved to: {run_dir}")
     print("\n=== Summary ===")
     for row in summary:
+        timing = row.get("timing_ms") or {}
         print(
             f"{row['category']:>6} | {row['mode']:<10} | t={row['threshold']:.2f} | "
             f"in={row['input_count']:<4} out={row['output_count']:<4} "
             f"drop={row['dropped_count']:<4} rate={row['dedup_rate']:<6} "
-            f"ms={row['duration_ms']:<5} fail_open={row['fail_open']}"
+            f"ms={row['duration_ms']:<5} embed={timing.get('embedding_ms', 0):<8} "
+            f"cluster={timing.get('clustering_ms', 0):<8} fail_open={row['fail_open']}"
         )
 
 

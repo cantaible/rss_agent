@@ -4,9 +4,9 @@ from pydantic import BaseModel, Field
 from typing import Literal
 
 # --- 长度控制常量（视觉宽度，1中文字=2英文字母） ---
-HEADLINE_LENGTH_MIN = 10  # 今日头条最短视觉宽度（中文字数）
-HEADLINE_LENGTH_MAX = 19  # 今日头条最长视觉宽度（中文字数）
-HEADLINE_LEN_MAX = 25     # 今日头条每条的字符数硬上限
+HEADLINE_LENGTH_MIN = 20  # 今日头条最短视觉宽度（中文字数）
+HEADLINE_LENGTH_MAX = 30  # 今日头条最长视觉宽度（中文字数）
+HEADLINE_LEN_MAX = 35     # 今日头条每条的字符数硬上限
 SUMMARY_LENGTH_MIN = 45   # 深度专题摘要最短视觉宽度（中文字数）
 SUMMARY_LENGTH_MAX = 60   # 深度专题摘要最长视觉宽度（中文字数）
 SUMMARY_LEN_MAX = 65      # 深度专题摘要的字符数硬上限
@@ -50,6 +50,25 @@ class NewsBriefing(BaseModel):
     headlines: List[TopHeadline] = Field(..., description=f"今日头条, 约{HEADLINE_COUNT}条最重要的热点新闻")
     clusters: List[NewsCluster] = Field(..., description="深度专题分类板块")
 
+# --- 评分编排路径的“仅改写”输出契约 ---
+# 说明：这里不让 LLM 负责 URL、排序、选材，只让它改写文本。
+class RewrittenHeadlineItem(BaseModel):
+    event_id: str = Field(..., description="事件ID，必须与输入一致")
+    title: str = Field(..., description="改写后的头条标题")
+
+
+class RewrittenHeadlineBatch(BaseModel):
+    items: List[RewrittenHeadlineItem] = Field(default_factory=list)
+
+
+class RewrittenSummaryItem(BaseModel):
+    event_id: str = Field(..., description="事件ID，必须与输入一致")
+    summary: str = Field(..., description="改写后的摘要")
+
+
+class RewrittenSummaryBatch(BaseModel):
+    items: List[RewrittenSummaryItem] = Field(default_factory=list)
+
 # --- Agent State ---
 class AgentState(TypedDict):
     # 消息历史
@@ -58,9 +77,15 @@ class AgentState(TypedDict):
     message_id: Optional[str]
     user_preference: Optional[str]
     news_content: Optional[str] 
+    # [新增] dedup 聚类轨迹，供 scorer 还原 event_size 使用
+    dedup_trace: Optional[Dict]
     
     # [新增] 结构化简报数据 (用于多轮回忆)
     briefing_data: Optional[Dict] # 实际存的是 NewsBriefing.model_dump()
+    # [新增] scorer 输出（统一事件结构）
+    scored_events: Optional[List[Dict]]
+    # [新增] scorer 元信息（耗时/token/策略模式）
+    scoring_meta: Optional[Dict]
     generated_at: Optional[str]
     
     # [新增] 当前选中的详情板块 (与 user_preference 长期偏好区分开)
@@ -89,8 +114,13 @@ from config import (
     NEWS_DEDUP_ENABLED,
     NEWS_DEDUP_MODE,
     NEWS_DEDUP_THRESHOLD,
+    NEWS_SCORING_DEBUG,
+    NEWS_SCORING_ENABLED,
+    NEWS_SCORING_FAIL_OPEN,
+    NEWS_SCORING_TOPK,
 )
 from simple_bot import llm_fast, llm_reasoning # Import capability-based LLMs
+from news_scoring_spec_v2 import score_events
 import json
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -233,7 +263,10 @@ def fetcher_node(state: AgentState):
                 return {
                     "user_preference": pref, 
                     "news_content": None, 
+                    "dedup_trace": None,
                     "briefing_data": briefing_json,
+                    "scored_events": None,
+                    "scoring_meta": None,
                     "generated_at": cached.get("generated_at")
                 }
             except Exception as e:
@@ -249,8 +282,9 @@ def fetcher_node(state: AgentState):
     news_data = fetch_news(pref)
 
     # 可插拔去重：默认由 config 开关控制，关闭时不影响原有流程
+    dedup_trace = None
     if NEWS_DEDUP_ENABLED:
-        news_data, dedup_meta, _ = dedupe_news_payload(
+        news_data, dedup_meta, dedup_trace = dedupe_news_payload(
             news_data,
             enabled=NEWS_DEDUP_ENABLED,
             mode=NEWS_DEDUP_MODE,
@@ -271,7 +305,10 @@ def fetcher_node(state: AgentState):
     return {
         "user_preference": pref,
         "news_content": json.dumps(news_data, ensure_ascii=False),
+        "dedup_trace": dedup_trace,
         "briefing_data": None,
+        "scored_events": None,
+        "scoring_meta": None,
         "generated_at": None,
         "selected_cluster": None,
     }
@@ -279,6 +316,66 @@ def fetcher_node(state: AgentState):
 from messaging import reply_message
 
 from lark_card_builder import build_cover_card
+
+
+def scorer_node(state: AgentState):
+    """
+    可插拔评分节点：
+    - 输入：fetcher 输出的去重后新闻（news_content）+ dedup_trace
+    - 输出：scored_events + scoring_meta
+    - 设计原则：失败可降级（fail-open），不阻塞主链路
+    """
+    print("🧮 [Scorer] Node started")
+
+    # 保护性判断：若开关关闭，理论上不会路由到这里；仍保留兜底避免误配置风险
+    if not NEWS_SCORING_ENABLED:
+        print("⏭️ [Scorer] Scoring disabled by config, skip.")
+        return {"scored_events": None, "scoring_meta": None}
+
+    news_json = state.get("news_content")
+    category = state.get("user_preference", "AI")
+    if not news_json:
+        print("⚠️ [Scorer] No news_content found, skip scoring.")
+        return {"scored_events": None, "scoring_meta": {"warning": "no_news_content"}}
+
+    try:
+        payload = json.loads(news_json)
+    except Exception as e:
+        print(f"⚠️ [Scorer] news_content parse failed: {e}")
+        if NEWS_SCORING_FAIL_OPEN:
+            return {
+                "scored_events": None,
+                "scoring_meta": {"error": f"parse_failed:{str(e)}", "fail_open": True},
+            }
+        return {"messages": [AIMessage(content=f"评分前数据解析失败：{str(e)}")]}
+
+    try:
+        # 核心评分调用（AI/full 与 GAMES/MUSIC/simple 在模块内自动分流）
+        scored_events, scoring_meta = score_events(
+            category=category,
+            deduped_payload=payload,
+            dedup_trace=state.get("dedup_trace"),
+            llm=llm_reasoning,
+            topk=NEWS_SCORING_TOPK,
+            debug=NEWS_SCORING_DEBUG,
+        )
+        print(
+            f"✅ [Scorer] Done. category={category} "
+            f"events={len(scored_events)} mode={(scoring_meta or {}).get('mode')}"
+        )
+        return {
+            "scored_events": scored_events,
+            "scoring_meta": scoring_meta,
+        }
+    except Exception as e:
+        print(f"❌ [Scorer] Failed: {e}")
+        # fail-open：评分失败时不影响 writer 旧流程
+        if NEWS_SCORING_FAIL_OPEN:
+            return {
+                "scored_events": None,
+                "scoring_meta": {"error": str(e), "fail_open": True},
+            }
+        return {"messages": [AIMessage(content=f"评分模块失败：{str(e)}")]}
 
 def writer_node(state: AgentState):
     """
@@ -313,7 +410,179 @@ def writer_node(state: AgentState):
         except Exception as e:
             print(f"⚠️ [Writer] Failed to reuse cache: {e}, falling back to generation")
             # 失败了则继续往下执行生成逻辑
-    
+
+    # 策略 0.5: 若评分模块产出可用，则 writer 只做“程序选材 + LLM改写”
+    # 关键约束：
+    # 1) 排序和选材由程序完成，LLM 不得改优先级
+    # 2) URL 由程序回填，LLM 不参与
+    # 3) 最终必须通过 NewsBriefing 校验；不通过则直接报错返回
+    scored_events = state.get("scored_events") or []
+    if scored_events:
+        try:
+            print(f"🧾 [Writer] Using scored events path. count={len(scored_events)}")
+
+            # 1) 固定板块配置（保持与现有卡片结构一致）
+            cluster_config = CATEGORY_CLUSTERS.get(category, CATEGORY_CLUSTERS["AI"])
+            cluster_names = [name for name, _ in cluster_config]
+
+            # 2) 输入最小校验：确保评分核心字段存在，避免后续组装不确定行为
+            for ev in scored_events:
+                required_keys = ["event_id", "cluster_label", "source_title", "selected_url", "final_score"]
+                missing_keys = [k for k in required_keys if k not in ev]
+                if missing_keys:
+                    raise ValueError(f"scored event missing keys={missing_keys}, event={ev}")
+
+            # 3) 评分结果按 final_score 排序，优先级完全由 scorer 决定
+            sorted_events = sorted(
+                scored_events,
+                key=lambda x: float(x.get("final_score", 0)),
+                reverse=True,
+            )
+            top_events = sorted_events[:HEADLINE_COUNT]
+
+            # 4) 先按板块筛选候选（程序规则），再交给 LLM 改写文本
+            cluster_items: Dict[str, List[Dict]] = {name: [] for name in cluster_names}
+            for ev in sorted_events:
+                name = ev.get("cluster_label")
+                if name in cluster_items and len(cluster_items[name]) < CLUSTER_ITEM_COUNT:
+                    cluster_items[name].append(
+                        {
+                            "event_id": ev.get("event_id"),
+                            "title": ev.get("source_title") or "",
+                            "summary": ev.get("source_summary") or "",
+                            "url": ev.get("selected_url") or "",
+                            "score": ev.get("final_score", 0),
+                        }
+                    )
+
+            # 5) 第一次 LLM 调用：只改写头条 title（event_id 对齐，不允许改排序）
+            headline_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        f"""你是资深行业情报编辑。用户订阅偏好：{category}。
+你只负责改写标题，不负责排序、不负责选条、不负责URL。
+请基于输入 events，逐条输出 event_id 和改写后的 title。
+title的改写要用 **一句话总结**，按视觉宽度尽量控制长度：**1个中文字 = 2个英文字母/数字**，总视觉宽度必须在 **{HEADLINE_LENGTH_MIN}~{HEADLINE_LENGTH_MAX}个中文字** 之间，且总字符数（中英文加在一起）**不得超过{HEADLINE_LEN_MAX}个
+文字要 **犀利、具体、直击要害**，必须提及具体公司名、产品名或关键数据
+约束：
+1. event_id 必须与输入完全一致，且数量一致
+2. 不得新增/删除/合并事件
+3. title 句末不要加句号
+4. 不要输出任何解释文本
+""",
+                    ),
+                    ("human", "{payload}"),
+                ]
+            )
+            headline_structured_llm = llm_reasoning.with_structured_output(RewrittenHeadlineBatch)
+            headline_chain = headline_prompt | headline_structured_llm
+            headline_payload = [
+                {
+                    "event_id": ev.get("event_id"),
+                    "title": ev.get("source_title") or "",
+                    "summary": ev.get("source_summary") or "",
+                    "cluster_label": ev.get("cluster_label") or "",
+                    "score": ev.get("final_score", 0),
+                }
+                for ev in top_events
+            ]
+            rewritten_headlines: RewrittenHeadlineBatch = headline_chain.invoke(
+                {"payload": json.dumps({"events": headline_payload}, ensure_ascii=False)}
+            )
+
+            # 6) 第二次 LLM 调用：只改写专题 summary（event_id 对齐，不允许改归类）
+            summary_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        f"""你是资深行业情报编辑。用户订阅偏好：{category}。
+你只负责改写摘要，不负责排序、不负责分组、不负责URL。
+请基于输入 events，逐条输出 event_id 和改写后的 summary。
+每条改写后的 summary要 **有吸引力**，能让人一眼看出新闻的价值
+       - 每条摘要仅可能尝试按照三小句的格式进行写作：发生了什么，细节补充描述，有什么影响
+       - 每条摘要按视觉宽度尽量控制长度：**1个中文字 = 2个英文字母/数字**，总视觉宽度必须在 **{SUMMARY_LENGTH_MIN}~{SUMMARY_LENGTH_MAX}个中文字** 之间，且总字符数（中英文加在一起）**不得超过{SUMMARY_LEN_MAX}个**，信息密度高，直击核心
+约束：
+1. event_id 必须与输入完全一致，且数量一致
+2. 不得新增/删除/合并事件
+3. summary 句末不要加句号
+4. 不要输出任何解释文本
+""",
+                    ),
+                    ("human", "{payload}"),
+                ]
+            )
+            summary_structured_llm = llm_reasoning.with_structured_output(RewrittenSummaryBatch)
+            summary_chain = summary_prompt | summary_structured_llm
+            flat_cluster_items = []
+            for cluster_name in cluster_names:
+                for item in cluster_items[cluster_name]:
+                    flat_cluster_items.append(
+                        {
+                            "event_id": item.get("event_id"),
+                            "cluster_label": cluster_name,
+                            "title": item.get("title") or "",
+                            "summary": item.get("summary") or "",
+                            "score": item.get("score", 0),
+                        }
+                    )
+            rewritten_summaries: RewrittenSummaryBatch = summary_chain.invoke(
+                {"payload": json.dumps({"events": flat_cluster_items}, ensure_ascii=False)}
+            )
+
+            # 7) 严格做 event_id 对齐校验；对不齐直接视为失败（不做自动修复）
+            expected_headline_ids = [str(ev.get("event_id")) for ev in top_events]
+            got_headline_ids = [str(it.event_id) for it in rewritten_headlines.items]
+            if sorted(expected_headline_ids) != sorted(got_headline_ids):
+                raise ValueError(
+                    f"headline rewrite ids mismatch. expected={expected_headline_ids}, got={got_headline_ids}"
+                )
+            expected_summary_ids = [str(it.get("event_id")) for it in flat_cluster_items]
+            got_summary_ids = [str(it.event_id) for it in rewritten_summaries.items]
+            if sorted(expected_summary_ids) != sorted(got_summary_ids):
+                raise ValueError(
+                    f"summary rewrite ids mismatch. expected={expected_summary_ids}, got={got_summary_ids}"
+                )
+
+            headline_text_by_id = {str(it.event_id): it.title for it in rewritten_headlines.items}
+            summary_text_by_id = {str(it.event_id): it.summary for it in rewritten_summaries.items}
+
+            # 8) 程序组装 NewsBriefing：URL 和板块顺序完全由程序控制
+            briefing_payload = {
+                "headlines": [
+                    {
+                        "title": headline_text_by_id[str(ev.get("event_id"))],
+                        "url": ev.get("selected_url") or "",
+                    }
+                    for ev in top_events
+                ],
+                "clusters": [
+                    {
+                        "name": cluster_name,
+                        "items": [
+                            {
+                                "summary": summary_text_by_id[str(item.get("event_id"))],
+                                "url": item.get("url") or "",
+                            }
+                            for item in cluster_items[cluster_name]
+                        ],
+                    }
+                    for cluster_name in cluster_names
+                ],
+            }
+
+            # 9) 最终强校验：若不符合 NewsBriefing，直接抛异常，不做修复兜底
+            briefing = NewsBriefing(**briefing_payload)
+
+            card_content = build_cover_card(briefing, category=category)
+            return {
+                "briefing_data": briefing.model_dump(),
+                "messages": [AIMessage(content=card_content)],
+            }
+        except Exception as e:
+            print(f"❌ [Writer] Scored-events generation failed: {e}")
+            return {"messages": [AIMessage(content=f"生成早报失败，请稍后重试。\nError: {str(e)}")]}
+
     # 策略 1: 如果没有 News Content (这不应该发生，Fetcher 应该处理了)，报错
     if not news_json:
         return {"messages": [AIMessage(content="未能获取新闻数据")]}
@@ -477,6 +746,7 @@ def chat_node(state):
 workflow.add_node("router", router_node)
 workflow.add_node("saver", saver_node)
 workflow.add_node("fetcher", fetcher_node)
+workflow.add_node("scorer", scorer_node)
 workflow.add_node("writer", writer_node)
 workflow.add_node("detail", detail_node) # 新增 Detail 节点
 workflow.add_node("chat", chat_node)
@@ -500,7 +770,12 @@ workflow.add_conditional_edges(
 # 5. 设置终点
 workflow.add_edge("saver", END)
 workflow.add_edge("chat", END)
-workflow.add_edge("fetcher", "writer")
+# 评分模块可插拔：默认关闭时保持旧链路不变，开启后插入 scorer
+if NEWS_SCORING_ENABLED:
+    workflow.add_edge("fetcher", "scorer")
+    workflow.add_edge("scorer", "writer")
+else:
+    workflow.add_edge("fetcher", "writer")
 workflow.add_edge("writer", END)
 workflow.add_edge("detail", END) # Detail -> END
 

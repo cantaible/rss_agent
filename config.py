@@ -26,3 +26,15 @@ DEDUP_EXPERIMENT_CATEGORIES = ["AI"]
 DEDUP_EXPERIMENT_MODES = ["off", "exact_only", "semantic"]
 # semantic 模式下要扫描的阈值列表
 DEDUP_EXPERIMENT_THRESHOLDS = [0.60]
+
+# --- News Scoring Config (默认关闭，确保主链路不受影响) ---
+# 是否启用评分模块（False 时 fetcher 直接进入 writer，完全保持旧行为）
+NEWS_SCORING_ENABLED = True
+# 评分失败是否自动降级为旧流程（建议保持 True，避免影响日报稳定性）
+NEWS_SCORING_FAIL_OPEN = True
+# 是否输出评分调试日志
+NEWS_SCORING_DEBUG = True
+# 今日头条默认取前 K 条高分事件
+NEWS_SCORING_TOPK = 10
+# 评分规范模块名（便于后续平滑切换不同实现）
+NEWS_SCORING_SPEC_MODULE = "news_scoring_spec_v2"
