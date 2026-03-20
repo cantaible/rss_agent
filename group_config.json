@@ -4,13 +4,14 @@
     "name": "新闻bot改进讨论",
     "enabled": true,
     "preferences": [
-      "MUSIC","GAMES"
+      "MUSIC",
+      "GAMES"
     ],
-    "interval_minutes": 120,
+    "interval_minutes": 60,
     "delivery_mode": "all",
     "timezone": "Asia/Shanghai"
-  }
-    {
+  },
+  {
     "chat_id": "oc_06a5a7810a82331adc719af6fd993be3",
     "name": "AI News Daily",
     "enabled": true,

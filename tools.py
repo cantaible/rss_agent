@@ -9,6 +9,17 @@ NEWS_API_URL = os.getenv(
     "http://43.134.96.131:9090/api/newsarticles/search",
 )
 
+
+def format_news_api_datetime(value: datetime) -> str:
+    normalized = value.astimezone(timezone.utc)
+    return normalized.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def post_news_search(payload: dict, timeout: int = 10):
+    headers = {"Content-Type": "application/json"}
+    return requests.post(NEWS_API_URL, headers=headers, json=payload, timeout=timeout)
+
+
 def fetch_news(
     category: str,
     start_dt: Optional[datetime] = None,
@@ -17,16 +28,13 @@ def fetch_news(
     """
     调用外部 API 获取新闻数据
     """
-    url = NEWS_API_URL
-    headers = {"Content-Type": "application/json"}
-    
     # 默认构造过去 24 小时 UTC 时间窗口；实验场景可外部传入固定时间
     if end_dt is None:
         end_dt = datetime.now(timezone.utc)
     if start_dt is None:
         start_dt = end_dt - timedelta(hours=24)
-    start_dt_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_dt_str = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_dt_str = format_news_api_datetime(start_dt)
+    end_dt_str = format_news_api_datetime(end_dt)
     
     payload = {
         "keyword": category,
@@ -42,7 +50,7 @@ def fetch_news(
             f"🌍 Fetching news category={category}, "
             f"startDateTime={start_dt_str}, endDateTime={end_dt_str}"
         )
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        resp = post_news_search(payload, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             # 假设返回的是列表，或者 data 字段里是列表

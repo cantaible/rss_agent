@@ -42,6 +42,18 @@ docker compose exec rss-agent python manual_trigger.py
 
 服务启动后，容器会监听 `36000` 端口。
 
+如果需要手动强制执行一次群推送测试：
+
+```bash
+docker compose exec rss-agent python manual_group_push.py
+```
+
+如果只想定向测试某一个群：
+
+```bash
+docker compose exec rss-agent python manual_group_push.py --chat-id oc_xxx
+```
+
 ### 2. 查看运行状态
 
 ```bash

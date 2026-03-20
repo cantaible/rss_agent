@@ -109,6 +109,7 @@ def build_default_runtime_state(now: datetime = None) -> Dict[str, Any]:
         "next_run_at": _serialize_datetime(current_time),
         "round_robin_index": 0,
         "last_success_at": None,
+        "last_window_end_at": None,
         "last_error": None,
     }
 
@@ -156,6 +157,21 @@ def _validate_optional_hour(raw_value: Any, field_name: str, errors: List[str]):
     return raw_value
 
 
+def _validate_non_negative_int(raw_value: Any, field_name: str, errors: List[str], default_value: int = 0):
+    if raw_value is None:
+        return default_value
+
+    if not isinstance(raw_value, int):
+        errors.append(f"{field_name} must be a non-negative integer")
+        return default_value
+
+    if raw_value < 0:
+        errors.append(f"{field_name} must be a non-negative integer")
+        return default_value
+
+    return raw_value
+
+
 def _validate_group_config_item(item: Any, index: int, seen_chat_ids: set):
     if not isinstance(item, dict):
         return None, [f"config item at index {index} must be an object"]
@@ -168,6 +184,7 @@ def _validate_group_config_item(item: Any, index: int, seen_chat_ids: set):
     interval_minutes = item.get("interval_minutes")
     delivery_mode = item.get("delivery_mode")
     timezone_name = item.get("timezone")
+    overlap_minutes = _validate_non_negative_int(item.get("overlap_minutes"), "overlap_minutes", errors)
 
     if not isinstance(chat_id, str) or not chat_id.strip():
         errors.append("chat_id is required and must be a non-empty string")
@@ -219,6 +236,7 @@ def _validate_group_config_item(item: Any, index: int, seen_chat_ids: set):
         "interval_minutes": interval_minutes,
         "delivery_mode": delivery_mode,
         "timezone": timezone_name,
+        "overlap_minutes": overlap_minutes,
         "start_hour": start_hour,
         "end_hour": end_hour,
     }, []
@@ -276,6 +294,7 @@ def ensure_runtime_state(
     last_sent_at = _parse_datetime(raw_state.get("last_sent_at"))
     next_run_at = _parse_datetime(raw_state.get("next_run_at"))
     last_success_at = _parse_datetime(raw_state.get("last_success_at"))
+    last_window_end_at = _parse_datetime(raw_state.get("last_window_end_at"))
     round_robin_index = raw_state.get("round_robin_index")
     last_error = raw_state.get("last_error")
 
@@ -292,6 +311,8 @@ def ensure_runtime_state(
         changed = True
     if raw_state.get("last_success_at") is not None and last_success_at is None:
         changed = True
+    if raw_state.get("last_window_end_at") is not None and last_window_end_at is None:
+        changed = True
 
     if last_error is not None and not isinstance(last_error, str):
         last_error = str(last_error)
@@ -302,14 +323,20 @@ def ensure_runtime_state(
         "next_run_at": _serialize_datetime(next_run_at) if next_run_at else default_state["next_run_at"],
         "round_robin_index": round_robin_index,
         "last_success_at": _serialize_datetime(last_success_at) if last_success_at else default_state["last_success_at"],
+        "last_window_end_at": (
+            _serialize_datetime(last_window_end_at)
+            if last_window_end_at
+            else default_state["last_window_end_at"]
+        ),
         "last_error": last_error if last_error else default_state["last_error"],
     }
 
-    if runtime_data.get(chat_id) != normalized_state:
-        runtime_data[chat_id] = normalized_state
+    previous_state = runtime_data.get(chat_id)
+    runtime_data[chat_id] = normalized_state
+    if previous_state != normalized_state:
         changed = True
 
-    return normalized_state, changed
+    return runtime_data[chat_id], changed
 
 
 def save_group_runtime(runtime_data: Dict[str, Dict[str, Any]]):
